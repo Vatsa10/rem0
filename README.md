@@ -1,4 +1,4 @@
-# Insurance Policy Renewal Reminder AI Voice Agent
+# Rem0 - Insurance Policy Renewal Reminder AI Voice Agent
 
 An AI-powered voice agent system that automatically calls policyholders to remind them about upcoming insurance policy renewals. Built with Vapi/Retell AI for voice interactions and Google Sheets as the data source.
 
@@ -21,8 +21,8 @@ An AI-powered voice agent system that automatically calls policyholders to remin
 
 1. **Clone and install**
    ```bash
-   git clone <repo>
-   cd <repo>
+   git clone https://github.com/Vatsa10/rem0
+   cd rem0
    python -m venv venv
    venv\Scripts\activate  # Windows
    pip install -r requirements.txt
@@ -133,7 +133,3 @@ Edit these files to customize:
 - `src/prompts.py` - Voice agent script and analysis prompt
 - `src/vapi_automation.py` - Call flow and CRM updates
 - `src/tools/call_analysis.py` - Response classification
-
-## License
-
-MIT
