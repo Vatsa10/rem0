@@ -13,6 +13,8 @@ dependencies = [
     "litellm",
     "python-dotenv",
     "pydantic",
+    "sqlalchemy[asyncio]",
+    "aiosqlite",
 ]
 
 [project.optional-dependencies]

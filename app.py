@@ -1,15 +1,20 @@
 import asyncio
 import logging
-import os
 
 import uvicorn
 from dotenv import load_dotenv
-from fastapi import FastAPI, WebSocket, HTTPException, Request
+from fastapi import FastAPI, WebSocket, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse, Response
 
 from src.config import CallConfig
 from src.automation import SubscriptionReminderAutomation
+from src.database import init_db, async_session, CallRecord
+from src.data.sqlite_loader import SQLiteLoader
+from src.api.subscribers import router as subscribers_router
+from src.api.calls import router as calls_router
+from src.api.settings import router as settings_router
+from src.api.dashboard import router as dashboard_router
 
 load_dotenv()
 
@@ -29,18 +34,29 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Global automation instance (initialized on first use)
+# API routers
+app.include_router(subscribers_router, prefix="/api")
+app.include_router(calls_router, prefix="/api")
+app.include_router(settings_router, prefix="/api")
+app.include_router(dashboard_router, prefix="/api")
+
+# Global automation instance
 _automation: SubscriptionReminderAutomation = None
 
 
-def get_automation() -> SubscriptionReminderAutomation:
-    """Get or create the automation singleton."""
+@app.on_event("startup")
+async def startup():
+    await init_db()
+    logger.info("Database initialized")
+
+
+async def get_automation() -> SubscriptionReminderAutomation:
     global _automation
     if _automation is None:
-        config = CallConfig.from_env()
-        # No data source by default — users plug in their own implementation.
-        # Pass a SubscriptionLoaderBase implementation here when ready.
-        _automation = SubscriptionReminderAutomation(config=config, data_source=None)
+        async with async_session() as db:
+            config = await CallConfig.from_db(db)
+        loader = SQLiteLoader(async_session)
+        _automation = SubscriptionReminderAutomation(config=config, data_source=loader)
     return _automation
 
 
@@ -55,14 +71,11 @@ async def initiate_calls(payload: dict):
     Start calling subscribers.
 
     Payload options:
-    - {"subscribers": [{"id": "1", "name": "...", "phone": "+91...", ...}]}
-      Direct subscriber list (when no data source configured).
-    - {"subscription_ids": ["1", "2"]}
-      Load from data source by IDs.
-    - {"due_within_days": 30}
-      Load from data source by renewal proximity.
+    - {"subscribers": [...]}           — direct subscriber list
+    - {"subscription_ids": ["1","2"]}  — load from DB by IDs
+    - {"due_within_days": 30}          — load from DB by renewal proximity
     """
-    automation = get_automation()
+    automation = await get_automation()
 
     subscribers_data = payload.get("subscribers", [])
     subscription_ids = payload.get("subscription_ids")
@@ -72,11 +85,6 @@ async def initiate_calls(payload: dict):
         from src.models.subscriber import Subscriber
         subscribers = [Subscriber(**s) for s in subscribers_data]
     elif subscription_ids or due_within_days:
-        if not automation.data_source:
-            raise HTTPException(
-                status_code=400,
-                detail="No data source configured. Pass subscribers directly.",
-            )
         subscribers = automation.load_subscribers(
             subscription_ids=subscription_ids,
             due_within_days=due_within_days,
@@ -100,6 +108,18 @@ async def initiate_calls(payload: dict):
                 "phone": subscriber.phone,
                 **result,
             })
+
+            # Save call record to DB
+            async with async_session() as db:
+                call_record = CallRecord(
+                    call_id=result["call_id"],
+                    call_sid=result.get("call_sid", ""),
+                    subscriber_id=subscriber.id,
+                    status="initiated",
+                )
+                db.add(call_record)
+                await db.commit()
+
             await asyncio.sleep(1)
         except Exception as e:
             logger.error(f"Failed to call {subscriber.name}: {e}")
@@ -117,40 +137,42 @@ async def initiate_calls(payload: dict):
 
 @app.post("/twiml/{call_id}")
 async def get_twiml(call_id: str):
-    """Return TwiML that connects the call to our WebSocket media stream."""
-    automation = get_automation()
+    automation = await get_automation()
     twiml = automation.get_twiml(call_id)
     return Response(content=twiml, media_type="application/xml")
 
 
 @app.websocket("/media-stream/{call_id}")
 async def media_stream(websocket: WebSocket, call_id: str):
-    """
-    Unified bidirectional WebSocket for a Twilio media stream.
-
-    Carries: audio in (mulaw), audio out (mulaw), VAD events,
-    barge-in signals, and call metadata — all on one connection.
-    """
-    automation = get_automation()
+    """Unified bidirectional WebSocket for Twilio media stream."""
+    automation = await get_automation()
     await automation.agent.handle_media_stream(websocket, call_id=call_id)
 
-    # Post-call: analyze transcript and update data source
+    # Post-call: analyze transcript and update data source + DB
     try:
         updates = await automation.evaluate_call_and_update(call_id)
         if updates:
-            logger.info(f"Post-call analysis complete: call_id={call_id}")
+            async with async_session() as db:
+                from sqlalchemy import select
+                query = select(CallRecord).where(CallRecord.call_id == call_id)
+                result = await db.execute(query)
+                record = result.scalar_one_or_none()
+                if record:
+                    record.status = "completed"
+                    record.transcript = updates.get("Transcript", "")
+                    record.summary = updates.get("Call Summary", "")
+                    record.response = updates.get("Response", "")
+                    record.justification = updates.get("Notes", "")
+                    record.next_steps = updates.get("Next Steps", "")
+                    await db.commit()
+            logger.info(f"Post-call analysis saved: call_id={call_id}")
     except Exception as e:
         logger.error(f"Post-call analysis failed: {e}")
 
 
 @app.get("/subscriptions/due")
 async def get_subscriptions_due(days: int = 30):
-    """Preview subscriptions due for reminder (without calling)."""
-    automation = get_automation()
-    if not automation.data_source:
-        raise HTTPException(
-            status_code=400, detail="No data source configured."
-        )
+    automation = await get_automation()
     subscribers = automation.load_subscribers(due_within_days=days)
     return {
         "count": len(subscribers),
@@ -160,8 +182,7 @@ async def get_subscriptions_due(days: int = 30):
 
 @app.get("/calls/{call_id}/status")
 async def get_call_status(call_id: str):
-    """Check status of an active or completed call."""
-    automation = get_automation()
+    automation = await get_automation()
     session = automation.agent.get_session(call_id)
     if not session:
         raise HTTPException(status_code=404, detail="Call not found.")
