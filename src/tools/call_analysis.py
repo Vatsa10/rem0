@@ -1,37 +1,42 @@
 from typing import Optional
 from pydantic import BaseModel, Field
 from src.utils import invoke_llm
-from src.prompts import CALL_ANALYSIS_PROMPT
+from src.conversation.prompts import CALL_ANALYSIS_PROMPT
 
 
 class CallAnalysisOutput(BaseModel):
     summary: str = Field(
         ...,
-        description="A concise summary highlighting the key talking points and interactions during the call.",
+        description="A concise summary of the key points from the call.",
     )
     response: str = Field(
         ...,
-        description="Customer response category: 'Confirmed Renewal', 'Interested - Needs Follow-up', 'Reschedule', 'Not Interested', 'No Decision', or 'Invalid Contact'.",
+        description="Subscriber response: 'Confirmed Renewal', 'Interested', 'Reschedule', 'Not Interested', 'No Decision', or 'Invalid Contact'.",
     )
     justification: Optional[str] = Field(
         default=None,
-        description="Justification for the response evaluation, providing context from the call transcript.",
+        description="Reasoning based on the call transcript.",
     )
     next_steps: Optional[str] = Field(
         default=None,
-        description="Any agreed next steps, callback time, or specific requests from the customer.",
+        description="Agreed follow-up actions or callback details.",
     )
 
 
-def analyze_call_transcript(policy_holder_name, transcript):
-    inputs = (
-        f"# Policy Holder Name: {policy_holder_name}\n# Call Transcript:\n {transcript}"
+async def analyze_call_transcript(subscriber_name: str, transcript: str) -> dict:
+    """Analyze a call transcript and return structured analysis."""
+    user_message = (
+        f"Subscriber Name: {subscriber_name}\n\n"
+        f"Call Transcript:\n{transcript}"
     )
-    call_analysis = invoke_llm(
+    result = invoke_llm(
         system_prompt=CALL_ANALYSIS_PROMPT,
-        user_message=inputs,
+        user_message=user_message,
+        model="groq/llama-3.3-70b-versatile",
         response_format=CallAnalysisOutput,
         json_output=True,
     )
 
-    return call_analysis
+    if isinstance(result, dict):
+        return CallAnalysisOutput(**result)
+    return result
