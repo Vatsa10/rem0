@@ -71,7 +71,7 @@ export default function SettingsPage() {
             <Label htmlFor="language">Default Language</Label>
             <Select
               value={settings.default_language}
-              onValueChange={(val: string) => val && setSettings({ ...settings, default_language: val })}
+              onValueChange={(val) => { if (val) setSettings({ ...settings, default_language: val }); }}
             >
               <SelectTrigger>
                 <SelectValue />

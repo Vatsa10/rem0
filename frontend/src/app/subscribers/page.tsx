@@ -24,7 +24,6 @@ import {
   DialogContent,
   DialogHeader,
   DialogTitle,
-  DialogTrigger,
 } from "@/components/ui/dialog";
 import { Label } from "@/components/ui/label";
 import { toast } from "sonner";
@@ -119,10 +118,8 @@ export default function SubscribersPage() {
     <div className="space-y-6">
       <div className="flex items-center justify-between">
         <h1 className="text-2xl font-bold text-gray-900">Subscribers</h1>
+        <Button onClick={openCreate}>Add Subscriber</Button>
         <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
-          <DialogTrigger>
-            <Button onClick={openCreate}>Add Subscriber</Button>
-          </DialogTrigger>
           <DialogContent className="max-w-lg">
             <DialogHeader>
               <DialogTitle>{editingId ? "Edit" : "Add"} Subscriber</DialogTitle>
@@ -165,7 +162,7 @@ export default function SubscribersPage() {
                 </div>
                 <div className="space-y-2">
                   <Label>Language</Label>
-                  <Select value={form.language} onValueChange={(v: string) => v && setForm({ ...form, language: v })}>
+                  <Select value={form.language} onValueChange={(v) => { if (v) setForm({ ...form, language: v }); }}>
                     <SelectTrigger><SelectValue /></SelectTrigger>
                     <SelectContent>
                       {Object.entries(LANGUAGES).map(([code, name]) => (
@@ -190,7 +187,7 @@ export default function SubscribersPage() {
           onChange={(e) => { setSearch(e.target.value); setPage(1); }}
           className="max-w-sm"
         />
-        <Select value={statusFilter} onValueChange={(v: string) => { setStatusFilter(!v || v === "ALL" ? "" : v); setPage(1); }}>
+        <Select value={statusFilter} onValueChange={(v) => { setStatusFilter(!v || v === "ALL" ? "" : v); setPage(1); }}>
           <SelectTrigger className="w-48">
             <SelectValue placeholder="Filter by status" />
           </SelectTrigger>
