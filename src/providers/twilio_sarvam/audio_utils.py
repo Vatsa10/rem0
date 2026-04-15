@@ -1,10 +1,5 @@
 import base64
-import sys
-
-if sys.version_info >= (3, 13):
-    import audioop_lts as audioop
-else:
-    import audioop
+import audioop
 
 
 def mulaw_to_pcm(mulaw_bytes: bytes) -> bytes:
