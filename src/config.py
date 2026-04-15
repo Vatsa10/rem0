@@ -94,6 +94,25 @@ class CallConfig(BaseModel):
             agent_name=os.getenv("AGENT_NAME", "Subscription Specialist"),
         )
 
+    @classmethod
+    async def from_db(cls, db_session) -> "CallConfig":
+        """Load settings from DB, API keys from .env."""
+        from src.database.models import Settings
+        settings = await db_session.get(Settings, 1)
+        return cls(
+            language=settings.default_language if settings else "hi-IN",
+            company_name=settings.company_name if settings else "Your Company",
+            agent_name=settings.agent_name if settings else "Subscription Specialist",
+            sarvam_api_key=os.getenv("SARVAM_API_KEY", ""),
+            twilio_account_sid=os.getenv("TWILIO_ACCOUNT_SID", ""),
+            twilio_auth_token=os.getenv("TWILIO_AUTH_TOKEN", ""),
+            twilio_from_number=os.getenv("TWILIO_FROM_NUMBER", ""),
+            llm_provider=os.getenv("LLM_PROVIDER", "groq"),
+            llm_model=os.getenv("LLM_MODEL", "llama-3.3-70b-versatile"),
+            llm_api_key=os.getenv("GROQ_API_KEY", ""),
+            server_url=os.getenv("SERVER_URL", ""),
+        )
+
 
 def get_language_config(language: str) -> dict:
     return LANGUAGE_CONFIGS.get(language, LANGUAGE_CONFIGS["hi-IN"])
