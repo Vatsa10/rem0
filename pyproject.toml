@@ -1,0 +1,19 @@
+[project]
+name = "subscription-reminder-voice-agent"
+version = "0.1.0"
+description = "AI-powered voice agent for subscription renewal reminders using Twilio + Sarvam AI"
+requires-python = ">=3.10"
+
+dependencies = [
+    "fastapi",
+    "uvicorn[standard]",
+    "twilio",
+    "websockets",
+    "httpx",
+    "litellm",
+    "python-dotenv",
+    "pydantic",
+]
+
+[project.optional-dependencies]
+py313 = ["audioop-lts"]
