@@ -1,16 +1,25 @@
+import asyncio
+import logging
 import os
-import time
+
 import uvicorn
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import RedirectResponse
-from src.base.leads_loader.google_sheets import GoogleSheetLeadLoader
-from src.vapi_automation import InsuranceReminderAutomation
 from dotenv import load_dotenv
+from fastapi import FastAPI, WebSocket, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse, Response
+
+from src.config import CallConfig
+from src.automation import SubscriptionReminderAutomation
 
 load_dotenv()
 
-app = FastAPI(title="Insurance Policy Renewal Reminder System")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+app = FastAPI(title="Subscription Reminder Voice Agent")
 
 app.add_middleware(
     CORSMiddleware,
@@ -18,132 +27,151 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["*"],
 )
 
+# Global automation instance (initialized on first use)
+_automation: SubscriptionReminderAutomation = None
 
-def get_automation():
-    """Initialize the automation with Google Sheets lead loader."""
-    lead_loader = GoogleSheetLeadLoader(
-        spreadsheet_id=os.getenv("SHEET_ID"),
-        sheet_name=os.getenv("SHEET_NAME", "Policies"),
-    )
-    return InsuranceReminderAutomation(lead_loader)
+
+def get_automation() -> SubscriptionReminderAutomation:
+    """Get or create the automation singleton."""
+    global _automation
+    if _automation is None:
+        config = CallConfig.from_env()
+        # No data source by default — users plug in their own implementation.
+        # Pass a SubscriptionLoaderBase implementation here when ready.
+        _automation = SubscriptionReminderAutomation(config=config, data_source=None)
+    return _automation
 
 
 @app.get("/")
-async def redirect_root_to_docs():
+async def root():
     return RedirectResponse("/docs")
 
 
-@app.post("/execute")
-async def execute(payload: dict):
+@app.post("/calls/initiate")
+async def initiate_calls(payload: dict):
     """
-    Trigger the policy reminder workflow.
+    Start calling subscribers.
 
     Payload options:
-    - {"policy_ids": ["1", "2"]} - Call specific policies by row number
-    - {"use_smart_filter": true, "days_before_renewal": 30} - Auto-filter policies due for reminder
+    - {"subscribers": [{"id": "1", "name": "...", "phone": "+91...", ...}]}
+      Direct subscriber list (when no data source configured).
+    - {"subscription_ids": ["1", "2"]}
+      Load from data source by IDs.
+    - {"due_within_days": 30}
+      Load from data source by renewal proximity.
     """
-    try:
-        automation = get_automation()
+    automation = get_automation()
 
-        policy_ids = payload.get("policy_ids")
-        use_smart_filter = payload.get("use_smart_filter", False)
-        days_before_renewal = payload.get("days_before_renewal", 30)
+    subscribers_data = payload.get("subscribers", [])
+    subscription_ids = payload.get("subscription_ids")
+    due_within_days = payload.get("due_within_days")
 
-        if use_smart_filter:
-            policies = automation.load_policies(
-                use_smart_filter=True, days_before_renewal=days_before_renewal
+    if subscribers_data:
+        from src.models.subscriber import Subscriber
+        subscribers = [Subscriber(**s) for s in subscribers_data]
+    elif subscription_ids or due_within_days:
+        if not automation.data_source:
+            raise HTTPException(
+                status_code=400,
+                detail="No data source configured. Pass subscribers directly.",
             )
-        elif policy_ids:
-            policies = automation.load_policies(policy_ids=policy_ids)
-        else:
-            return {
-                "message": "Please provide policy_ids or set use_smart_filter to true."
-            }
-
-        if not policies:
-            return {"message": "No policies found to call."}
-
-        print(f"Found {len(policies)} policies to process")
-
-        results = []
-        for policy in policies:
-            automation.pre_call_processing(policy)
-            call_params = automation.get_call_input_params(policy)
-            print(
-                f"Calling {policy.name} ({policy.phone}) - Policy #{policy.policy_number}"
-            )
-
-            output = await automation.make_call(call_params)
-            results.append(
-                {
-                    "policy_id": policy.id,
-                    "policy_number": policy.policy_number,
-                    "name": policy.name,
-                    "call_response": output,
-                }
-            )
-
-            time.sleep(1)
-
-        return {
-            "message": f"Successfully initiated calls for {len(policies)} policies.",
-            "results": results,
-        }
-
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        print(f"Error: {e}")
+        subscribers = automation.load_subscribers(
+            subscription_ids=subscription_ids,
+            due_within_days=due_within_days,
+        )
+    else:
         raise HTTPException(
-            status_code=500, detail="An error occurred while executing the workflow"
+            status_code=400,
+            detail="Provide 'subscribers', 'subscription_ids', or 'due_within_days'.",
         )
 
+    if not subscribers:
+        return {"message": "No subscribers found.", "results": []}
 
-@app.post("/webhook")
-async def handle_webhook(request: Request):
+    results = []
+    for subscriber in subscribers:
+        try:
+            result = await automation.initiate_call(subscriber)
+            results.append({
+                "subscriber_id": subscriber.id,
+                "name": subscriber.name,
+                "phone": subscriber.phone,
+                **result,
+            })
+            await asyncio.sleep(1)
+        except Exception as e:
+            logger.error(f"Failed to call {subscriber.name}: {e}")
+            results.append({
+                "subscriber_id": subscriber.id,
+                "name": subscriber.name,
+                "error": str(e),
+            })
+
+    return {
+        "message": f"Initiated calls for {len(results)} subscribers.",
+        "results": results,
+    }
+
+
+@app.post("/twiml/{call_id}")
+async def get_twiml(call_id: str):
+    """Return TwiML that connects the call to our WebSocket media stream."""
+    automation = get_automation()
+    twiml = automation.get_twiml(call_id)
+    return Response(content=twiml, media_type="application/xml")
+
+
+@app.websocket("/media-stream/{call_id}")
+async def media_stream(websocket: WebSocket, call_id: str):
     """
-    Handle incoming webhook requests from Vapi.
+    Unified bidirectional WebSocket for a Twilio media stream.
+
+    Carries: audio in (mulaw), audio out (mulaw), VAD events,
+    barge-in signals, and call metadata — all on one connection.
     """
+    automation = get_automation()
+    await automation.agent.handle_media_stream(websocket, call_id=call_id)
+
+    # Post-call: analyze transcript and update data source
     try:
-        automation = get_automation()
-        response = await automation.handle_webhook_call(request)
-        return response
+        updates = await automation.evaluate_call_and_update(call_id)
+        if updates:
+            logger.info(f"Post-call analysis complete: call_id={call_id}")
     except Exception as e:
-        print(f"Error processing webhook: {e}")
-        raise HTTPException(status_code=400, detail="Invalid webhook payload")
+        logger.error(f"Post-call analysis failed: {e}")
 
 
-@app.get("/policies/due")
-async def get_policies_due():
-    """
-    Get list of policies due for reminder (without calling them).
-    """
-    try:
-        automation = get_automation()
-        policies = automation.load_policies(
-            use_smart_filter=True, days_before_renewal=30
+@app.get("/subscriptions/due")
+async def get_subscriptions_due(days: int = 30):
+    """Preview subscriptions due for reminder (without calling)."""
+    automation = get_automation()
+    if not automation.data_source:
+        raise HTTPException(
+            status_code=400, detail="No data source configured."
         )
-        return {
-            "count": len(policies),
-            "policies": [
-                {
-                    "id": p.id,
-                    "name": p.name,
-                    "phone": p.phone,
-                    "policy_number": p.policy_number,
-                    "policy_type": p.policy_type,
-                    "renewal_date": p.renewal_date,
-                    "premium": p.premium,
-                }
-                for p in policies
-            ],
-        }
-    except Exception as e:
-        print(f"Error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    subscribers = automation.load_subscribers(due_within_days=days)
+    return {
+        "count": len(subscribers),
+        "subscriptions": [s.model_dump() for s in subscribers],
+    }
+
+
+@app.get("/calls/{call_id}/status")
+async def get_call_status(call_id: str):
+    """Check status of an active or completed call."""
+    automation = get_automation()
+    session = automation.agent.get_session(call_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Call not found.")
+    return {
+        "call_id": call_id,
+        "call_sid": session.call_sid,
+        "status": session.status,
+        "subscriber": session.subscriber.name,
+        "has_transcript": bool(session.transcript),
+    }
 
 
 if __name__ == "__main__":
