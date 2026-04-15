@@ -28,7 +28,7 @@ export default function SettingsPage() {
     if (!settings) return;
     setSaving(true);
     try {
-      const updated = await api.updateSettings(settings) as Settings;
+      const updated = await api.updateSettings(settings as unknown as Record<string, unknown>) as Settings;
       setSettings(updated);
       toast.success("Settings saved successfully");
     } catch {
@@ -71,7 +71,7 @@ export default function SettingsPage() {
             <Label htmlFor="language">Default Language</Label>
             <Select
               value={settings.default_language}
-              onValueChange={(val) => setSettings({ ...settings, default_language: val })}
+              onValueChange={(val: string) => val && setSettings({ ...settings, default_language: val })}
             >
               <SelectTrigger>
                 <SelectValue />
