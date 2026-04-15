@@ -52,7 +52,7 @@ export default function CallsPage() {
       <h1 className="text-2xl font-bold text-gray-900">Call History</h1>
 
       <div className="flex gap-4">
-        <Select value={statusFilter} onValueChange={(v) => { setStatusFilter(v === "ALL" ? "" : v); setPage(1); }}>
+        <Select value={statusFilter} onValueChange={(v) => { setStatusFilter(!v || v === "ALL" ? "" : v); setPage(1); }}>
           <SelectTrigger className="w-48">
             <SelectValue placeholder="Filter by status" />
           </SelectTrigger>
