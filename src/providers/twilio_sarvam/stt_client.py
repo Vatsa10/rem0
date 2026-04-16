@@ -31,8 +31,6 @@ def _wrap_pcm_as_wav(pcm: bytes, sample_rate: int) -> bytes:
 
 logger = logging.getLogger(__name__)
 
-PING_INTERVAL_SEC = 30
-
 
 class SarvamSTTClient:
     """
@@ -60,7 +58,11 @@ class SarvamSTTClient:
         self.ws = None
         self._is_open = False
         self._event_queue: asyncio.Queue[dict] = asyncio.Queue()
-        self._ping_task: Optional[asyncio.Task] = None
+        # Buffer ~200ms of audio (3200 bytes PCM s16le @ 8kHz) per STT message.
+        # Twilio sends 20ms frames; sending each one individually as a WAV
+        # file is both wasteful and too short for accurate recognition.
+        self._buffer_target_bytes = int(sample_rate * 2 * 0.2)
+        self._audio_buffer = bytearray()
 
     @property
     def is_open(self) -> bool:
@@ -84,24 +86,8 @@ class SarvamSTTClient:
             f"sr={self.sample_rate}Hz, vad=on"
         )
         asyncio.create_task(self._receive_loop())
-        self._ping_task = asyncio.create_task(self._ping_loop())
-
-    async def _ping_loop(self) -> None:
-        """Keep the connection alive."""
-        try:
-            while self._is_open:
-                await asyncio.sleep(PING_INTERVAL_SEC)
-                if not self._is_open or not self.ws:
-                    break
-                try:
-                    await self.ws.send(json.dumps({"type": "ping"}))
-                except websockets.ConnectionClosed:
-                    break
-                except Exception as e:
-                    logger.debug(f"STT ping error: {e}")
-                    break
-        except asyncio.CancelledError:
-            pass
+        # No ping loop for STT — Sarvam STT doesn't support ping messages,
+        # and the constant Twilio audio stream keeps the connection alive.
 
     async def _receive_loop(self) -> None:
         """Background task to receive STT events and push to the queue."""
@@ -131,13 +117,24 @@ class SarvamSTTClient:
 
     async def send_audio(self, pcm_audio: bytes) -> None:
         """
-        Send a chunk of PCM s16le mono audio to Sarvam STT.
-        Each chunk is wrapped in a minimal WAV header (Sarvam requires audio/wav).
+        Append PCM s16le mono audio to the buffer. Flush to Sarvam STT
+        once we have ~200ms of audio — Sarvam can't transcribe 20ms chunks well.
         """
-        if not self.is_open:
+        if not self.is_open or not pcm_audio:
             return
+
+        self._audio_buffer.extend(pcm_audio)
+        if len(self._audio_buffer) >= self._buffer_target_bytes:
+            await self._flush_buffer()
+
+    async def _flush_buffer(self) -> None:
+        """Wrap the buffered PCM in a WAV container and send to Sarvam."""
+        if not self._audio_buffer or not self.is_open:
+            return
+        pcm = bytes(self._audio_buffer)
+        self._audio_buffer.clear()
         try:
-            wav_bytes = _wrap_pcm_as_wav(pcm_audio, self.sample_rate)
+            wav_bytes = _wrap_pcm_as_wav(pcm, self.sample_rate)
             b64 = base64.b64encode(wav_bytes).decode("utf-8")
             message = {
                 "audio": {
@@ -164,9 +161,13 @@ class SarvamSTTClient:
                 continue
 
     async def close(self) -> None:
+        # Flush any buffered audio so a final transcript can still come through.
+        if self._is_open and self._audio_buffer:
+            try:
+                await self._flush_buffer()
+            except Exception as e:
+                logger.debug(f"STT flush on close: {e}")
         self._is_open = False
-        if self._ping_task and not self._ping_task.done():
-            self._ping_task.cancel()
         if self.ws:
             try:
                 await self.ws.close()

@@ -6,12 +6,10 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
-# Sarvam bulbul:v2 voices (as of Apr 2026):
-# Female: anushka, manisha, vidya, arya, ritu, priya, neha, pooja, simran,
-#         kavya, ishita, shreya, roopa, tanya, shruti, suhani, kavitha, rupali
-# Male:   abhilash, hitesh, aditya, rahul, rohan, amit, dev, varun, manan,
-#         sumit, kabir, aayan, shubh, ashutosh, advait, anand, tarun, sunny,
-#         mani, gokul, vijay, mohit, rehan, soham
+# Sarvam bulbul:v2 WebSocket TTS voices (April 2026):
+# Female: anushka, manisha, vidya, arya
+# Male:   abhilash, hitesh, karun
+# (bulbul:v3 has 40+ voices but the WS endpoint currently forces v2)
 LANGUAGE_CONFIGS = {
     "hi-IN": {
         "stt_code": "hi-IN",
@@ -25,7 +23,7 @@ LANGUAGE_CONFIGS = {
     },
     "en-IN": {
         "stt_code": "en-IN",
-        "tts_voice": "anushka",
+        "tts_voice": "hitesh",
         "llm_hint": "Respond in English with an Indian conversational style.",
     },
     "ta-IN": {

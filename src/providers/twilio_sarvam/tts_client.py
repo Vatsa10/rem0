@@ -43,13 +43,15 @@ class SarvamTTSClient:
         self.ws = await websockets.connect(self.WS_URL, additional_headers=headers)
         self._is_open = True
 
-        # Correct Sarvam TTS config field names — see docs.
+        # Sarvam TTS WS config — the WS endpoint uses bulbul:v2 by default
+        # (the model field is ignored). bulbul:v2 supports these voices:
+        # Female: anushka, manisha, vidya, arya
+        # Male:   abhilash, hitesh, karun
         config = {
             "type": "config",
             "data": {
                 "target_language_code": self.language,
                 "speaker": self.voice,
-                "model": "bulbul:v2",
                 "output_audio_codec": "mulaw",
                 "speech_sample_rate": "8000",
                 "min_buffer_size": 50,
@@ -140,8 +142,16 @@ class SarvamTTSClient:
     async def synthesize(self, text: str) -> AsyncGenerator[bytes, None]:
         """
         Send text to TTS; yield mulaw 8kHz audio chunks as they stream back.
-        Audio is ready to send directly to Twilio (after base64 encoding by caller).
+
+        Strategy: wait up to FIRST_CHUNK_TIMEOUT for the first audio chunk,
+        then use a short INACTIVITY_TIMEOUT between subsequent chunks.
+        Sarvam sends audio in rapid bursts — a gap means the burst is done.
         """
+        # Skip empty / whitespace / non-language text (Sarvam rejects these).
+        clean = (text or "").strip()
+        if not clean or not any(c.isalnum() for c in clean):
+            return
+
         if not self.is_open:
             logger.warning("TTS synthesize: not open, skipping")
             return
@@ -149,7 +159,7 @@ class SarvamTTSClient:
         self._cancelled = False
 
         try:
-            await self.ws.send(json.dumps({"type": "text", "data": {"text": text}}))
+            await self.ws.send(json.dumps({"type": "text", "data": {"text": clean}}))
             await self.ws.send(json.dumps({"type": "flush"}))
         except websockets.ConnectionClosed:
             self._is_open = False
@@ -158,11 +168,16 @@ class SarvamTTSClient:
             logger.error(f"TTS send error: {e}")
             return
 
+        FIRST_CHUNK_TIMEOUT = 5.0    # allow some cold-start latency
+        INACTIVITY_TIMEOUT = 0.4     # Sarvam streams fast — 400ms gap = done
+
         chunks_yielded = 0
         bytes_yielded = 0
+        timeout = FIRST_CHUNK_TIMEOUT
+
         while True:
             try:
-                chunk = await asyncio.wait_for(self._audio_queue.get(), timeout=10.0)
+                chunk = await asyncio.wait_for(self._audio_queue.get(), timeout=timeout)
                 if chunk is None:
                     break
                 if self._cancelled:
@@ -170,10 +185,10 @@ class SarvamTTSClient:
                 chunks_yielded += 1
                 bytes_yielded += len(chunk)
                 yield chunk
+                timeout = INACTIVITY_TIMEOUT
             except asyncio.TimeoutError:
-                logger.warning(
-                    f"TTS synthesize timeout after {chunks_yielded} chunks"
-                )
+                if chunks_yielded == 0:
+                    logger.warning(f"TTS: no audio in {timeout}s for text {clean!r}")
                 break
 
         logger.debug(
