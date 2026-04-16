@@ -194,9 +194,9 @@ class TwilioSarvamAgent(BaseVoiceAgent):
 
         try:
             # If pre-warm hasn't finished (very fast answer), connect now.
-            if not session.stt.ws or not session.stt.ws.open:
+            if not session.stt.is_open:
                 await session.stt.connect()
-            if not session.tts.ws or not session.tts.ws.open:
+            if not session.tts.is_open:
                 await session.tts.connect()
 
             stt_task = asyncio.create_task(

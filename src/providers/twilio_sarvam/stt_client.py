@@ -1,5 +1,5 @@
-import json
 import asyncio
+import json
 import logging
 from typing import AsyncGenerator, Optional
 
@@ -17,8 +17,13 @@ class SarvamSTTClient:
         self.language = language
         self.api_key = api_key
         self.model = model
-        self.ws: Optional[websockets.WebSocketClientProtocol] = None
+        self.ws = None
+        self._is_open = False
         self._transcript_queue: asyncio.Queue[dict] = asyncio.Queue()
+
+    @property
+    def is_open(self) -> bool:
+        return self._is_open and self.ws is not None
 
     async def connect(self) -> None:
         """Open WebSocket connection to Sarvam STT."""
@@ -29,6 +34,7 @@ class SarvamSTTClient:
         )
         headers = {"api-subscription-key": self.api_key}
         self.ws = await websockets.connect(url, additional_headers=headers)
+        self._is_open = True
         logger.info(f"Sarvam STT connected: lang={self.language}, model={self.model}")
         asyncio.create_task(self._receive_loop())
 
@@ -40,16 +46,22 @@ class SarvamSTTClient:
                     event = json.loads(message)
                     await self._transcript_queue.put(event)
                 except json.JSONDecodeError:
-                    logger.warning(f"STT: non-JSON message received: {message[:100]}")
+                    logger.warning(f"STT: non-JSON message received: {str(message)[:100]}")
         except websockets.ConnectionClosed:
             logger.info("Sarvam STT connection closed")
         except Exception as e:
             logger.error(f"STT receive error: {e}")
+        finally:
+            self._is_open = False
 
     async def send_audio(self, pcm_audio: bytes) -> None:
         """Send PCM audio chunk (s16le, 8kHz) to Sarvam STT."""
-        if self.ws and self.ws.open:
+        if not self.is_open:
+            return
+        try:
             await self.ws.send(pcm_audio)
+        except websockets.ConnectionClosed:
+            self._is_open = False
 
     async def receive_events(self) -> AsyncGenerator[dict, None]:
         """Yield STT events (transcript, speech_start, speech_end) as they arrive."""
@@ -64,6 +76,10 @@ class SarvamSTTClient:
 
     async def close(self) -> None:
         """Close the STT WebSocket connection."""
-        if self.ws and self.ws.open:
-            await self.ws.close()
+        if self.ws and self._is_open:
+            try:
+                await self.ws.close()
+            except Exception as e:
+                logger.debug(f"STT close: {e}")
             logger.info("Sarvam STT disconnected")
+        self._is_open = False
