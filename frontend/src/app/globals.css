@@ -2,53 +2,43 @@
 
 /* ======================================================
    SubReminder — Blue & White SaaS Theme
-   Inspired by Stripe, Linear, Vercel: clean, bright, soft shadows.
    ====================================================== */
 
 :root {
   /* Core palette */
-  --background: #f8fafc;        /* slate-50 — soft app background */
-  --foreground: #0f172a;         /* slate-900 — body text */
+  --background: #f8fafc;
+  --foreground: #0f172a;
   --card: #ffffff;
   --card-foreground: #0f172a;
   --popover: #ffffff;
   --popover-foreground: #0f172a;
 
-  /* Brand blue — primary action */
-  --primary: #2563eb;            /* blue-600 */
+  /* Brand blue */
+  --primary: #2563eb;
   --primary-foreground: #ffffff;
 
-  /* Secondary / muted blues */
-  --secondary: #eff6ff;          /* blue-50 */
-  --secondary-foreground: #1e40af;  /* blue-800 */
-  --muted: #f1f5f9;              /* slate-100 */
-  --muted-foreground: #64748b;   /* slate-500 */
-  --accent: #dbeafe;             /* blue-100 */
+  --secondary: #eff6ff;
+  --secondary-foreground: #1e40af;
+  --muted: #f1f5f9;
+  --muted-foreground: #475569;   /* darker for readability */
+  --accent: #dbeafe;
   --accent-foreground: #1e40af;
 
   /* Semantic */
-  --destructive: #dc2626;        /* red-600 */
+  --destructive: #dc2626;
   --destructive-foreground: #ffffff;
-  --success: #16a34a;            /* green-600 */
-  --warning: #ca8a04;            /* yellow-600 */
+  --success: #16a34a;
+  --warning: #ca8a04;
 
-  /* Borders & rings */
-  --border: #e2e8f0;             /* slate-200 */
-  --input: #e2e8f0;
-  --ring: #3b82f6;               /* blue-500 */
+  --border: #e2e8f0;
+  --input: #cbd5e1;
+  --ring: #3b82f6;
 
-  /* Radius — slightly rounded for modern SaaS feel */
   --radius: 0.625rem;
   --radius-sm: 0.375rem;
   --radius-md: 0.5rem;
   --radius-lg: 0.75rem;
   --radius-xl: 1rem;
-
-  /* Shadows — subtle, layered */
-  --shadow-sm: 0 1px 2px 0 rgb(15 23 42 / 0.04);
-  --shadow: 0 1px 3px 0 rgb(15 23 42 / 0.06), 0 1px 2px -1px rgb(15 23 42 / 0.04);
-  --shadow-md: 0 4px 12px -2px rgb(15 23 42 / 0.08), 0 2px 4px -2px rgb(15 23 42 / 0.04);
-  --shadow-lg: 0 12px 24px -6px rgb(15 23 42 / 0.10), 0 4px 8px -4px rgb(15 23 42 / 0.06);
 }
 
 @theme inline {
@@ -73,38 +63,85 @@
   --color-border: var(--border);
   --color-input: var(--input);
   --color-ring: var(--ring);
+
   --radius-sm: var(--radius-sm);
   --radius-md: var(--radius-md);
   --radius-lg: var(--radius-lg);
   --radius-xl: var(--radius-xl);
-  --font-sans: var(--font-geist), ui-sans-serif, system-ui, -apple-system, sans-serif;
+
+  --font-sans: var(--font-sans), ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-display: var(--font-display), var(--font-sans), sans-serif;
 }
 
 * {
   border-color: var(--border);
 }
 
+html {
+  color: var(--foreground);
+}
+
 body {
   background: var(--background);
   color: var(--foreground);
   font-family: var(--font-sans);
+  font-feature-settings: "cv02", "cv03", "cv04", "cv11";
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
 
-/* Subtle gradient on the app background for that SaaS feel */
+/* Display font for headings — Plus Jakarta Sans */
+h1, h2, h3, h4, h5, h6 {
+  font-family: var(--font-display);
+  letter-spacing: -0.02em;
+  color: #0f172a;
+}
+
+/* Subtle gradient background */
 body::before {
   content: "";
   position: fixed;
   inset: 0;
   z-index: -1;
   background:
-    radial-gradient(ellipse 1200px 600px at 50% -200px, rgb(219 234 254 / 0.5), transparent),
-    radial-gradient(ellipse 800px 400px at 100% 100%, rgb(219 234 254 / 0.3), transparent);
+    radial-gradient(ellipse 1200px 600px at 50% -200px, rgb(219 234 254 / 0.6), transparent),
+    radial-gradient(ellipse 800px 400px at 100% 100%, rgb(219 234 254 / 0.4), transparent);
   pointer-events: none;
 }
 
-/* Smooth scrollbar */
+/* Force solid popover background — fixes dropdown transparency */
+[data-slot="select-content"],
+[data-slot="dialog-content"],
+[data-radix-popper-content-wrapper] > *,
+[role="listbox"],
+[role="dialog"] {
+  background-color: #ffffff !important;
+  color: #0f172a !important;
+}
+
+[data-slot="select-item"] {
+  color: #0f172a;
+}
+[data-slot="select-item"][data-highlighted],
+[data-slot="select-item"]:hover,
+[data-slot="select-item"]:focus {
+  background-color: #eff6ff;
+  color: #1d4ed8;
+}
+
+/* Make placeholder text visible but not loud */
+input::placeholder,
+textarea::placeholder {
+  color: #94a3b8;
+}
+
+/* Ensure labels and body text are always dark */
+label {
+  color: #1e293b;
+  font-weight: 500;
+}
+
+/* Scrollbar */
 ::-webkit-scrollbar {
   width: 10px;
   height: 10px;
@@ -113,9 +150,9 @@ body::before {
   background: transparent;
 }
 ::-webkit-scrollbar-thumb {
-  background: var(--border);
+  background: #cbd5e1;
   border-radius: 999px;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: #cbd5e1;
+  background: #94a3b8;
 }
