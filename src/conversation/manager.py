@@ -9,7 +9,15 @@ from .prompts import get_system_prompt
 
 logger = logging.getLogger(__name__)
 
-SENTENCE_TERMINATORS = {".", "?", "!", "।", "?"}
+# Hard sentence terminators — always flush on these.
+SENTENCE_TERMINATORS = (".", "?", "!", "।", "?", "؟")
+
+# Soft phrase boundaries — flush if accumulated text has enough words.
+PHRASE_BOUNDARIES = (",", ";", ":", "—", "–")
+
+# Minimum word count before a phrase boundary triggers a flush.
+# Too low = choppy speech. Too high = no latency benefit.
+MIN_PHRASE_WORDS = 6
 
 
 class ConversationState(str, Enum):
@@ -74,17 +82,34 @@ class ConversationManager:
 
     def accumulate_token(self, token: str) -> Optional[str]:
         """
-        Accumulate LLM tokens and return a sentence when a boundary is detected.
-        Returns the sentence text when ready, or None if still accumulating.
+        Accumulate LLM tokens and return a speakable chunk when a boundary is hit.
+
+        Priority:
+        1. Hard sentence terminator (. ? ! etc.) — always flush.
+        2. Phrase boundary (, ; :) — flush if chunk has >= MIN_PHRASE_WORDS.
+
+        Returns the chunk text when ready, or None if still accumulating.
         """
         self._accumulated_text += token
-        for terminator in SENTENCE_TERMINATORS:
-            if terminator in self._accumulated_text:
-                idx = self._accumulated_text.rindex(terminator)
-                sentence = self._accumulated_text[: idx + 1].strip()
+
+        # Hard boundary — always flush.
+        for term in SENTENCE_TERMINATORS:
+            if term in self._accumulated_text:
+                idx = self._accumulated_text.rindex(term)
+                chunk = self._accumulated_text[: idx + 1].strip()
                 self._accumulated_text = self._accumulated_text[idx + 1 :].strip()
-                if sentence:
-                    return sentence
+                if chunk:
+                    return chunk
+
+        # Soft phrase boundary — flush if long enough for natural cadence.
+        for boundary in PHRASE_BOUNDARIES:
+            if boundary in self._accumulated_text:
+                idx = self._accumulated_text.rindex(boundary)
+                candidate = self._accumulated_text[: idx + 1].strip()
+                if len(candidate.split()) >= MIN_PHRASE_WORDS:
+                    self._accumulated_text = self._accumulated_text[idx + 1 :].strip()
+                    return candidate
+
         return None
 
     def flush_accumulated(self) -> Optional[str]:

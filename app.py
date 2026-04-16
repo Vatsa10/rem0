@@ -7,6 +7,7 @@ from fastapi import FastAPI, WebSocket, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse, Response
 
+from src.cache import get_greeting_cache
 from src.config import CallConfig
 from src.automation import SubscriptionReminderAutomation
 from src.database import init_db, async_session, CallRecord
@@ -48,6 +49,31 @@ _automation: SubscriptionReminderAutomation = None
 async def startup():
     await init_db()
     logger.info("Database initialized")
+
+    # Pre-connect greeting cache (Memurai/Redis on localhost:6379 by default).
+    cache = get_greeting_cache()
+    await cache.connect()
+
+    # Pre-warm the automation + LLM HTTP connection pool.
+    automation = await get_automation()
+    try:
+        await automation.agent._get_shared_llm().warmup()
+        logger.info("LLM client pre-warmed")
+    except Exception as e:
+        logger.warning(f"LLM warmup skipped: {e}")
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    if _automation is not None:
+        try:
+            await _automation.agent._get_shared_llm().close()
+        except Exception:
+            pass
+    try:
+        await get_greeting_cache().close()
+    except Exception:
+        pass
 
 
 async def get_automation() -> SubscriptionReminderAutomation:

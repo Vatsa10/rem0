@@ -9,12 +9,13 @@ dependencies = [
     "uvicorn[standard]",
     "twilio",
     "websockets",
-    "httpx",
+    "httpx[http2]",
     "litellm",
     "python-dotenv",
     "pydantic",
     "sqlalchemy[asyncio]",
     "aiosqlite",
+    "redis[hiredis]",
 ]
 
 [project.optional-dependencies]

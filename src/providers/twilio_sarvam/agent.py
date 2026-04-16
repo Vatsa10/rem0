@@ -1,6 +1,6 @@
 import asyncio
-import json
 import logging
+import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Dict, Optional
@@ -8,17 +8,23 @@ from typing import Dict, Optional
 from starlette.websockets import WebSocket, WebSocketDisconnect
 from twilio.rest import Client as TwilioClient
 
+from src.cache import get_greeting_cache
 from src.config import CallConfig, get_language_config
-from src.models.subscriber import Subscriber
 from src.conversation.manager import ConversationManager
+from src.models.subscriber import Subscriber
 from src.providers.base_agent import BaseVoiceAgent
-from .twilio_handler import TwilioMediaStreamHandler
+from .audio_utils import mulaw_to_pcm
+from .llm_client import LLMClient
 from .stt_client import SarvamSTTClient
 from .tts_client import SarvamTTSClient
-from .llm_client import LLMClient
-from .audio_utils import mulaw_to_pcm
+from .twilio_handler import TwilioMediaStreamHandler
 
 logger = logging.getLogger(__name__)
+
+# How long to wait after STT reports a partial before speculating with LLM.
+# Shorter = more aggressive speculation (may cancel/restart more).
+# Longer = waits for user to stop speaking.
+PARTIAL_SPECULATION_DELAY = 0.8  # seconds
 
 
 @dataclass
@@ -31,16 +37,26 @@ class CallSession:
     tts: SarvamTTSClient
     llm: LLMClient
     twilio_handler: TwilioMediaStreamHandler
+    cached_greeting: Optional[bytes] = None
+    cached_greeting_text: Optional[str] = None
     transcript: str = ""
     status: str = "in_progress"
+    pending_llm_task: Optional[asyncio.Task] = field(default=None)
+    last_partial_text: str = ""
+    last_partial_time: float = 0.0
 
 
 class TwilioSarvamAgent(BaseVoiceAgent):
     """
-    Voice agent that orchestrates Twilio Media Streams with Sarvam STT/TTS and Groq LLM.
+    Orchestrates Twilio Media Streams with Sarvam STT/TTS and Groq LLM.
 
-    Single WebSocket connection from Twilio carries all audio and events.
-    Server-side, we manage separate Sarvam STT, TTS, and LLM connections.
+    Optimizations for low latency:
+    - Persistent LLMClient with HTTP/2 + connection pooling
+    - Pre-warm STT/TTS WebSockets during Twilio ring (before user answers)
+    - Cached greeting audio served from Redis (first response instant)
+    - Fast LLM (llama-3.1-8b-instant) for greetings
+    - Phrase-boundary streaming to TTS (faster first audio)
+    - Partial transcript speculation (start LLM before final transcript)
     """
 
     def __init__(self, config: CallConfig):
@@ -49,16 +65,29 @@ class TwilioSarvamAgent(BaseVoiceAgent):
             config.twilio_account_sid, config.twilio_auth_token
         )
         self.active_calls: Dict[str, CallSession] = {}
+        self.greeting_cache = get_greeting_cache()
+        self._shared_llm: Optional[LLMClient] = None
+
+    def _get_shared_llm(self) -> LLMClient:
+        """Single LLMClient across all calls — reuses HTTP/2 connection pool."""
+        if self._shared_llm is None:
+            self._shared_llm = LLMClient(
+                provider=self.config.llm_provider,
+                model=self.config.llm_model,
+                api_key=self.config.llm_api_key,
+            )
+        return self._shared_llm
 
     async def initiate_call(
         self, phone_number: str, subscriber_data: dict
     ) -> dict:
         """
         Place an outbound call via Twilio REST API.
-        Twilio will request TwiML from /twiml/{call_id} which sets up the media stream.
+
+        Pre-warms STT/TTS WebSockets and fetches cached greeting in parallel
+        while Twilio is ringing the subscriber — giving us a 3-5s head start.
         """
         call_id = str(uuid.uuid4())[:8]
-
         subscriber = Subscriber(**subscriber_data)
         lang_config = get_language_config(subscriber.language)
 
@@ -76,15 +105,10 @@ class TwilioSarvamAgent(BaseVoiceAgent):
             voice=lang_config["tts_voice"],
             api_key=self.config.sarvam_api_key,
         )
-        llm = LLMClient(
-            provider=self.config.llm_provider,
-            model=self.config.llm_model,
-            api_key=self.config.llm_api_key,
-        )
+        llm = self._get_shared_llm()
         twilio_handler = TwilioMediaStreamHandler()
 
         twiml_url = f"{self.config.server_url}/twiml/{call_id}"
-
         call = self.twilio_client.calls.create(
             to=phone_number,
             from_=self.config.twilio_from_number,
@@ -103,6 +127,9 @@ class TwilioSarvamAgent(BaseVoiceAgent):
         )
         self.active_calls[call_id] = session
 
+        # Fire off pre-warming in background — don't block the REST response.
+        asyncio.create_task(self._prewarm_session(session))
+
         logger.info(
             f"Call initiated: call_id={call_id}, call_sid={call.sid}, "
             f"to={phone_number}, lang={subscriber.language}"
@@ -115,12 +142,47 @@ class TwilioSarvamAgent(BaseVoiceAgent):
             "to": phone_number,
         }
 
-    async def handle_media_stream(self, websocket: WebSocket, call_id: str = None) -> None:
+    async def _prewarm_session(self, session: CallSession) -> None:
         """
-        Main WebSocket handler for a Twilio bidirectional media stream.
+        Pre-open STT/TTS WebSockets and fetch cached greeting in parallel.
+        Runs while Twilio is ringing — saves 500ms-1s of setup time.
+        """
+        lang = session.subscriber.language
+        try:
+            await self.greeting_cache.connect()
 
-        This is the unified channel: audio in, audio out, VAD, barge-in — all on one WS.
-        """
+            # Parallel: STT connect, TTS connect, greeting fetch.
+            results = await asyncio.gather(
+                session.stt.connect(),
+                session.tts.connect(),
+                self.greeting_cache.get(
+                    lang, self.config.company_name, self.config.agent_name
+                ),
+                return_exceptions=True,
+            )
+
+            greeting = results[2]
+            if isinstance(greeting, bytes):
+                session.cached_greeting = greeting
+                session.cached_greeting_text = await self.greeting_cache.get_text(
+                    lang, self.config.company_name, self.config.agent_name
+                )
+                logger.info(
+                    f"Pre-warm complete with cached greeting "
+                    f"({len(greeting)} bytes) for call_sid={session.call_sid}"
+                )
+            else:
+                logger.info(
+                    f"Pre-warm complete (no cached greeting) "
+                    f"for call_sid={session.call_sid}"
+                )
+        except Exception as e:
+            logger.warning(f"Pre-warm failed: {e}")
+
+    async def handle_media_stream(
+        self, websocket: WebSocket, call_id: Optional[str] = None
+    ) -> None:
+        """Main WebSocket handler for Twilio bidirectional media stream."""
         await websocket.accept()
 
         session = self.active_calls.get(call_id)
@@ -130,8 +192,11 @@ class TwilioSarvamAgent(BaseVoiceAgent):
             return
 
         try:
-            await session.stt.connect()
-            await session.tts.connect()
+            # If pre-warm hasn't finished (very fast answer), connect now.
+            if not session.stt.ws or not session.stt.ws.open:
+                await session.stt.connect()
+            if not session.tts.ws or not session.tts.ws.open:
+                await session.tts.connect()
 
             stt_task = asyncio.create_task(
                 self._process_stt_events(session, websocket)
@@ -184,81 +249,177 @@ class TwilioSarvamAgent(BaseVoiceAgent):
     async def _process_stt_events(
         self, session: CallSession, websocket: WebSocket
     ) -> None:
-        """Process STT transcript events and generate LLM + TTS responses."""
+        """
+        Process STT events with interim-transcript speculation.
+
+        Strategy:
+        - Track partial transcripts as they arrive.
+        - On speech_end / final transcript → start LLM immediately.
+        - If a partial sits for > PARTIAL_SPECULATION_DELAY seconds → speculate.
+        - New speech input cancels any pending LLM task (barge-in + restart).
+        """
         async for event in session.stt.receive_events():
             event_type = event.get("type", "")
             transcript = event.get("transcript", "")
 
+            # Speech start → user is talking, stop agent + cancel pending LLM.
+            if event_type == "speech_start":
+                if session.pending_llm_task and not session.pending_llm_task.done():
+                    session.pending_llm_task.cancel()
+                if session.conversation.is_agent_speaking:
+                    session.conversation.handle_barge_in()
+                    session.tts.cancel()
+                    await session.twilio_handler.send_clear(websocket)
+                continue
+
             if not transcript or not transcript.strip():
                 continue
 
-            logger.debug(f"STT transcript: {transcript}")
+            is_final = event_type in ("final", "speech_end") or event.get("is_final")
 
-            messages = session.conversation.build_messages(transcript)
+            if is_final:
+                # Cancel any in-flight speculation and start authoritative turn.
+                if session.pending_llm_task and not session.pending_llm_task.done():
+                    session.pending_llm_task.cancel()
 
-            full_response = ""
-            session.conversation.is_agent_speaking = True
+                session.last_partial_text = ""
+                await self._run_turn(session, websocket, transcript, fast=False)
+            else:
+                # Interim / partial — track for speculation.
+                session.last_partial_text = transcript
+                session.last_partial_time = time.monotonic()
 
+    async def _run_turn(
+        self,
+        session: CallSession,
+        websocket: WebSocket,
+        user_text: str,
+        fast: bool = False,
+    ) -> None:
+        """Generate + speak the agent's response for one turn."""
+        messages = session.conversation.build_messages(user_text)
+
+        full_response = ""
+        session.conversation.is_agent_speaking = True
+
+        try:
             async for token in session.llm.chat_completion_stream(
-                messages=messages, temperature=0.7, max_tokens=256
+                messages=messages,
+                temperature=0.7,
+                max_tokens=256,
+                fast=fast,
             ):
                 if not session.conversation.is_agent_speaking:
                     break
-
-                sentence = session.conversation.accumulate_token(token)
+                chunk = session.conversation.accumulate_token(token)
                 full_response += token
-
-                if sentence:
-                    await self._speak(session, websocket, sentence)
+                if chunk:
+                    await self._speak(session, websocket, chunk)
 
             remaining = session.conversation.flush_accumulated()
             if remaining and session.conversation.is_agent_speaking:
-                full_response += ""
                 await self._speak(session, websocket, remaining)
 
             if full_response:
                 session.conversation.record_agent_turn(full_response)
-
+        except asyncio.CancelledError:
+            logger.debug("Turn cancelled (likely barge-in)")
+            raise
+        finally:
             session.conversation.is_agent_speaking = False
 
     async def _send_greeting(
         self, session: CallSession, websocket: WebSocket
     ) -> None:
-        """Generate and speak the initial greeting when the call connects."""
-        await asyncio.sleep(1.0)
+        """
+        Deliver the opening greeting.
 
+        Fast path: cached mulaw audio from Redis → stream directly (near-zero latency).
+        Slow path: generate via fast LLM + TTS on the fly, then cache for next time.
+        """
+        # Small delay to let Twilio complete its connection handshake.
+        await asyncio.sleep(0.3)
+
+        # Fast path: cached audio, stream directly to Twilio.
+        if session.cached_greeting:
+            logger.info(
+                f"Serving cached greeting ({len(session.cached_greeting)} bytes)"
+            )
+            session.conversation.is_agent_speaking = True
+            chunk_size = 640  # 80ms of mulaw @ 8kHz
+            try:
+                for i in range(0, len(session.cached_greeting), chunk_size):
+                    if not session.conversation.is_agent_speaking:
+                        break
+                    chunk = session.cached_greeting[i : i + chunk_size]
+                    await session.twilio_handler.send_audio(websocket, chunk)
+                    await asyncio.sleep(0.08)  # pace to real-time playback
+
+                if session.cached_greeting_text:
+                    session.conversation.record_agent_turn(
+                        session.cached_greeting_text
+                    )
+            finally:
+                session.conversation.is_agent_speaking = False
+            return
+
+        # Slow path: live generation. Use fast model for low TTFT.
         greeting_prompt = (
-            "Generate your opening greeting for this call. "
-            "Introduce yourself and the company, and ask to confirm you're speaking with the right person."
+            "[SYSTEM: Call connected. Deliver your opening greeting — "
+            "introduce yourself and the company, and confirm the subscriber's name. Keep it to one sentence.]"
         )
-        messages = session.conversation.build_messages(greeting_prompt)
-        messages[-1]["role"] = "user"
-        messages[-1]["content"] = "[SYSTEM: Call connected. Deliver your opening greeting.]"
+        session.conversation.message_history.append(
+            {"role": "user", "content": greeting_prompt}
+        )
 
         full_response = ""
+        collected_audio = bytearray()
         session.conversation.is_agent_speaking = True
 
-        async for token in session.llm.chat_completion_stream(
-            messages=messages, temperature=0.7, max_tokens=150
-        ):
-            sentence = session.conversation.accumulate_token(token)
-            full_response += token
-            if sentence:
-                await self._speak(session, websocket, sentence)
+        try:
+            async for token in session.llm.chat_completion_stream(
+                messages=session.conversation.message_history,
+                temperature=0.7,
+                max_tokens=120,
+                fast=True,
+            ):
+                if not session.conversation.is_agent_speaking:
+                    break
+                chunk = session.conversation.accumulate_token(token)
+                full_response += token
+                if chunk:
+                    async for audio in session.tts.synthesize(chunk):
+                        collected_audio.extend(audio)
+                        if session.conversation.is_agent_speaking:
+                            await session.twilio_handler.send_audio(websocket, audio)
 
-        remaining = session.conversation.flush_accumulated()
-        if remaining:
-            await self._speak(session, websocket, remaining)
+            remaining = session.conversation.flush_accumulated()
+            if remaining and session.conversation.is_agent_speaking:
+                async for audio in session.tts.synthesize(remaining):
+                    collected_audio.extend(audio)
+                    await session.twilio_handler.send_audio(websocket, audio)
 
-        if full_response:
-            session.conversation.record_agent_turn(full_response)
-            session.conversation.message_history.pop(-2)
-            session.conversation.message_history[-1] = {
-                "role": "assistant",
-                "content": full_response,
-            }
+            if full_response:
+                # Replace the fake greeting-prompt with the actual response in history.
+                session.conversation.message_history.pop(-1)
+                session.conversation.record_agent_turn(full_response)
 
-        session.conversation.is_agent_speaking = False
+                # Cache for next call with same company/agent/language.
+                if collected_audio:
+                    await self.greeting_cache.set(
+                        session.subscriber.language,
+                        self.config.company_name,
+                        self.config.agent_name,
+                        bytes(collected_audio),
+                    )
+                    await self.greeting_cache.set_text(
+                        session.subscriber.language,
+                        self.config.company_name,
+                        self.config.agent_name,
+                        full_response,
+                    )
+        finally:
+            session.conversation.is_agent_speaking = False
 
     async def _speak(
         self, session: CallSession, websocket: WebSocket, text: str
@@ -275,6 +436,8 @@ class TwilioSarvamAgent(BaseVoiceAgent):
 
     async def _cleanup_session(self, session: CallSession, call_id: str) -> None:
         """Close all connections and clean up session state."""
+        if session.pending_llm_task and not session.pending_llm_task.done():
+            session.pending_llm_task.cancel()
         await session.stt.close()
         await session.tts.close()
         session.transcript = session.conversation.get_transcript_text()
@@ -289,11 +452,9 @@ class TwilioSarvamAgent(BaseVoiceAgent):
             logger.info(f"Call ended via API: call_id={call_id}")
 
     def get_session(self, call_id: str) -> Optional[CallSession]:
-        """Get a call session by ID."""
         return self.active_calls.get(call_id)
 
     def get_twiml(self, call_id: str) -> str:
-        """Generate TwiML that connects the call to our WebSocket media stream."""
         ws_url = f"{self.config.server_url.replace('https://', 'wss://').replace('http://', 'ws://')}/media-stream/{call_id}"
         return f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>

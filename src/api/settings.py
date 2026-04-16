@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.cache import get_greeting_cache
 from src.database import get_db, Settings
 
 router = APIRouter(prefix="/settings", tags=["settings"])
@@ -30,6 +31,9 @@ async def update_settings(data: SettingsUpdate, db: AsyncSession = Depends(get_d
         settings = Settings(id=1)
         db.add(settings)
 
+    old_company = settings.company_name
+    old_agent = settings.agent_name
+
     update_data = data.model_dump(exclude_none=True)
     for key, value in update_data.items():
         setattr(settings, key, value)
@@ -37,8 +41,18 @@ async def update_settings(data: SettingsUpdate, db: AsyncSession = Depends(get_d
     await db.commit()
     await db.refresh(settings)
 
-    # Reset automation singleton so it picks up new settings
+    # Reset automation singleton so it picks up new settings on next call.
     import app as app_module
     app_module._automation = None
+
+    # If company/agent name changed, invalidate greeting cache — old audio no longer valid.
+    if (
+        "company_name" in update_data and update_data["company_name"] != old_company
+    ) or (
+        "agent_name" in update_data and update_data["agent_name"] != old_agent
+    ):
+        cache = get_greeting_cache()
+        await cache.connect()
+        await cache.invalidate_all()
 
     return settings.to_dict()
