@@ -158,6 +158,7 @@ class TwilioSarvamAgent(BaseVoiceAgent):
         Runs while Twilio is ringing — saves 500ms-1s of setup time.
         """
         lang = session.subscriber.language
+        voice = session.tts.voice
         try:
             await self.greeting_cache.connect()
 
@@ -166,7 +167,7 @@ class TwilioSarvamAgent(BaseVoiceAgent):
                 session.stt.connect(),
                 session.tts.connect(),
                 self.greeting_cache.get(
-                    lang, self.config.company_name, self.config.agent_name
+                    lang, voice, self.config.company_name, self.config.agent_name
                 ),
                 return_exceptions=True,
             )
@@ -175,11 +176,12 @@ class TwilioSarvamAgent(BaseVoiceAgent):
             if isinstance(greeting, bytes):
                 session.cached_greeting = greeting
                 session.cached_greeting_text = await self.greeting_cache.get_text(
-                    lang, self.config.company_name, self.config.agent_name
+                    lang, voice, self.config.company_name, self.config.agent_name
                 )
                 logger.info(
                     f"Pre-warm complete with cached greeting "
-                    f"({len(greeting)} bytes) for call_sid={session.call_sid}"
+                    f"({len(greeting)} bytes, voice={voice}) "
+                    f"for call_sid={session.call_sid}"
                 )
             else:
                 logger.info(
@@ -324,8 +326,8 @@ class TwilioSarvamAgent(BaseVoiceAgent):
         try:
             async for token in session.llm.chat_completion_stream(
                 messages=messages,
-                temperature=0.7,
-                max_tokens=256,
+                temperature=0.5,   # lower temp = less rambling
+                max_tokens=60,     # hard cap to enforce short replies
                 fast=fast,
             ):
                 if not session.conversation.is_agent_speaking:
@@ -387,8 +389,12 @@ class TwilioSarvamAgent(BaseVoiceAgent):
         # Slow path: live generation. Use fast model for low TTFT.
         logger.info(f"Generating live greeting for {session.subscriber.name}")
         greeting_prompt = (
-            "[SYSTEM: Call connected. Deliver your opening greeting — "
-            "introduce yourself and the company, and confirm the subscriber's name. Keep it to one sentence.]"
+            "[SYSTEM: Call connected. Say one short sentence: greet by name, "
+            "say who you are from {company}, ask 'is this {name}?'. "
+            "MAX 15 WORDS. No introductions like 'I am calling about' yet.]"
+        ).format(
+            company=self.config.company_name,
+            name=session.subscriber.name,
         )
         session.conversation.message_history.append(
             {"role": "user", "content": greeting_prompt}
@@ -402,8 +408,8 @@ class TwilioSarvamAgent(BaseVoiceAgent):
         try:
             async for token in session.llm.chat_completion_stream(
                 messages=session.conversation.message_history,
-                temperature=0.7,
-                max_tokens=120,
+                temperature=0.5,
+                max_tokens=50,   # greeting is one short sentence
                 fast=True,
             ):
                 if not session.conversation.is_agent_speaking:
@@ -436,16 +442,18 @@ class TwilioSarvamAgent(BaseVoiceAgent):
                 session.conversation.message_history.pop(-1)
                 session.conversation.record_agent_turn(full_response)
 
-                # Cache for next call with same company/agent/language.
+                # Cache for next call with same language/voice/company/agent.
                 if collected_audio:
                     await self.greeting_cache.set(
                         session.subscriber.language,
+                        session.tts.voice,
                         self.config.company_name,
                         self.config.agent_name,
                         bytes(collected_audio),
                     )
                     await self.greeting_cache.set_text(
                         session.subscriber.language,
+                        session.tts.voice,
                         self.config.company_name,
                         self.config.agent_name,
                         full_response,
