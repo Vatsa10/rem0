@@ -22,13 +22,12 @@ class GreetingCache:
 
     async def connect(self) -> None:
         if self._client is None:
-            self._client = redis.from_url(
-                self.url,
-                encoding=None,
-                decode_responses=False,
-                socket_keepalive=True,
-            )
             try:
+                self._client = redis.from_url(
+                    self.url,
+                    decode_responses=False,
+                    socket_keepalive=True,
+                )
                 await self._client.ping()
                 logger.info(f"Greeting cache connected: {self.url}")
             except Exception as e:

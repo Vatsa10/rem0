@@ -75,6 +75,7 @@ class TwilioSarvamAgent(BaseVoiceAgent):
                 provider=self.config.llm_provider,
                 model=self.config.llm_model,
                 api_key=self.config.llm_api_key,
+                fast_model=self.config.llm_fast_model,
             )
         return self._shared_llm
 

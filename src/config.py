@@ -73,6 +73,7 @@ class CallConfig(BaseModel):
     twilio_from_number: str
     llm_provider: str = "groq"
     llm_model: str = "llama-3.3-70b-versatile"
+    llm_fast_model: str = "llama-3.1-8b-instant"
     llm_api_key: str
     server_url: str
     company_name: str = "Your Company"
@@ -88,6 +89,7 @@ class CallConfig(BaseModel):
             twilio_from_number=os.getenv("TWILIO_FROM_NUMBER", ""),
             llm_provider=os.getenv("LLM_PROVIDER", "groq"),
             llm_model=os.getenv("LLM_MODEL", "llama-3.3-70b-versatile"),
+            llm_fast_model=os.getenv("LLM_FAST_MODEL", "llama-3.1-8b-instant"),
             llm_api_key=os.getenv("GROQ_API_KEY", ""),
             server_url=os.getenv("SERVER_URL", ""),
             company_name=os.getenv("COMPANY_NAME", "Your Company"),
@@ -109,6 +111,7 @@ class CallConfig(BaseModel):
             twilio_from_number=os.getenv("TWILIO_FROM_NUMBER", ""),
             llm_provider=os.getenv("LLM_PROVIDER", "groq"),
             llm_model=os.getenv("LLM_MODEL", "llama-3.3-70b-versatile"),
+            llm_fast_model=os.getenv("LLM_FAST_MODEL", "llama-3.1-8b-instant"),
             llm_api_key=os.getenv("GROQ_API_KEY", ""),
             server_url=os.getenv("SERVER_URL", ""),
         )
