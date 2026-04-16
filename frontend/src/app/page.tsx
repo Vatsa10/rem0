@@ -13,6 +13,7 @@ import {
 } from "@/components/ui/table";
 import { api } from "@/lib/api";
 import { DashboardStats, STATUS_COLORS } from "@/lib/types";
+import { CallNowCard } from "@/components/dashboard/call-now-card";
 
 export default function DashboardPage() {
   const [stats, setStats] = useState<DashboardStats | null>(null);
@@ -52,6 +53,8 @@ export default function DashboardPage() {
           </Card>
         ))}
       </div>
+
+      <CallNowCard />
 
       <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
         <Card>
