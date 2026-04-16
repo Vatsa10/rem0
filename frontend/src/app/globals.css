@@ -1,7 +1,7 @@
 @import "tailwindcss";
 
 /* ======================================================
-   SubReminder — Blue & White SaaS Theme
+   Rem0 — Blue & White SaaS Theme
    ====================================================== */
 
 :root {
@@ -20,7 +20,8 @@
   --secondary: #eff6ff;
   --secondary-foreground: #1e40af;
   --muted: #f1f5f9;
-  --muted-foreground: #475569;   /* darker for readability */
+  --muted-foreground: #475569;
+  /* darker for readability */
   --accent: #dbeafe;
   --accent-foreground: #1e40af;
 
@@ -91,7 +92,12 @@ body {
 }
 
 /* Display font for headings — Plus Jakarta Sans */
-h1, h2, h3, h4, h5, h6 {
+h1,
+h2,
+h3,
+h4,
+h5,
+h6 {
   font-family: var(--font-display);
   letter-spacing: -0.02em;
   color: #0f172a;
@@ -112,7 +118,7 @@ body::before {
 /* Force solid popover background — fixes dropdown transparency */
 [data-slot="select-content"],
 [data-slot="dialog-content"],
-[data-radix-popper-content-wrapper] > *,
+[data-radix-popper-content-wrapper]>*,
 [role="listbox"],
 [role="dialog"] {
   background-color: #ffffff !important;
@@ -122,6 +128,7 @@ body::before {
 [data-slot="select-item"] {
   color: #0f172a;
 }
+
 [data-slot="select-item"][data-highlighted],
 [data-slot="select-item"]:hover,
 [data-slot="select-item"]:focus {
@@ -146,13 +153,16 @@ label {
   width: 10px;
   height: 10px;
 }
+
 ::-webkit-scrollbar-track {
   background: transparent;
 }
+
 ::-webkit-scrollbar-thumb {
   background: #cbd5e1;
   border-radius: 999px;
 }
+
 ::-webkit-scrollbar-thumb:hover {
   background: #94a3b8;
 }

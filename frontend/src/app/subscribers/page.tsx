@@ -119,7 +119,10 @@ export default function SubscribersPage() {
   return (
     <div className="space-y-6">
       <div className="flex items-center justify-between">
-        <h1 className="text-2xl font-bold text-gray-900">Subscribers</h1>
+        <div>
+          <h1 className="font-display text-3xl font-bold tracking-tight text-slate-900">Subscribers</h1>
+          <p className="mt-1 text-sm text-slate-500">Manage subscribers and their renewal details</p>
+        </div>
         <Button onClick={openCreate}>Add Subscriber</Button>
         <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
           <DialogContent className="max-w-lg">

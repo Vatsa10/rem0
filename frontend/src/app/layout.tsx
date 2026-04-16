@@ -18,7 +18,7 @@ const jakarta = Plus_Jakarta_Sans({
 });
 
 export const metadata: Metadata = {
-  title: "SubReminder — Subscription Voice Agent",
+  title: "Rem0 — Subscription Voice Agent",
   description: "AI-powered subscription renewal reminder system",
 };
 

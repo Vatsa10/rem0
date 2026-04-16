@@ -51,7 +51,10 @@ export default function CallsPage() {
 
   return (
     <div className="space-y-6">
-      <h1 className="text-2xl font-bold text-gray-900">Call History</h1>
+      <div>
+        <h1 className="font-display text-3xl font-bold tracking-tight text-slate-900">Call History</h1>
+        <p className="mt-1 text-sm text-slate-500">All outbound calls with transcripts and analysis</p>
+      </div>
 
       <div className="flex gap-4">
         <Select value={statusFilter} onValueChange={(v) => { setStatusFilter(!v || v === "ALL" ? "" : v); setPage(1); }}>

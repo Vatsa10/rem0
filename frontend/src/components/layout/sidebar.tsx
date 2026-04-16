@@ -63,7 +63,7 @@ export function Sidebar() {
           </svg>
         </div>
         <div>
-          <div className="text-base font-semibold text-slate-900">SubReminder</div>
+          <div className="text-base font-semibold text-slate-900">Rem0</div>
           <div className="text-xs text-slate-500">Voice Agent SaaS</div>
         </div>
       </div>
