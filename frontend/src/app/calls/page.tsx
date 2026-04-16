@@ -21,6 +21,7 @@ import {
 } from "@/components/ui/select";
 import { api } from "@/lib/api";
 import { CallRecord, PaginatedResponse } from "@/lib/types";
+import { useCallSubscriber } from "@/hooks/use-call-subscriber";
 
 const RESPONSE_COLORS: Record<string, string> = {
   "Confirmed Renewal": "bg-green-100 text-green-800",
@@ -36,6 +37,7 @@ export default function CallsPage() {
   const [statusFilter, setStatusFilter] = useState("");
   const [page, setPage] = useState(1);
   const [expandedId, setExpandedId] = useState<string | null>(null);
+  const { callSubscriber, callingId } = useCallSubscriber();
 
   const load = useCallback(() => {
     const params: Record<string, unknown> = { page, limit: 20 };
@@ -75,6 +77,7 @@ export default function CallsPage() {
               <TableHead>Status</TableHead>
               <TableHead>Response</TableHead>
               <TableHead>Summary</TableHead>
+              <TableHead className="w-32"></TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
@@ -116,10 +119,20 @@ export default function CallsPage() {
                   <TableCell className="max-w-xs truncate text-sm text-gray-500">
                     {call.summary || "-"}
                   </TableCell>
+                  <TableCell onClick={(e) => e.stopPropagation()}>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      disabled={callingId === call.subscriber_id}
+                      onClick={() => callSubscriber(call.subscriber_id, call.subscriber_name)}
+                    >
+                      {callingId === call.subscriber_id ? "Calling..." : "Call Again"}
+                    </Button>
+                  </TableCell>
                 </TableRow>
                 {expandedId === call.call_id && (
                   <TableRow key={`${call.call_id}-detail`}>
-                    <TableCell colSpan={6} className="bg-gray-50 p-0">
+                    <TableCell colSpan={7} className="bg-gray-50 p-0">
                       <Card className="m-4 border-0 shadow-none">
                         <CardContent className="space-y-4 pt-4">
                           {call.summary && (
@@ -173,7 +186,7 @@ export default function CallsPage() {
             ))}
             {data?.items.length === 0 && (
               <TableRow>
-                <TableCell colSpan={6} className="py-8 text-center text-gray-500">
+                <TableCell colSpan={7} className="py-8 text-center text-gray-500">
                   No calls recorded yet
                 </TableCell>
               </TableRow>

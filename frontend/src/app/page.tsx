@@ -11,13 +11,16 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
+import { Button } from "@/components/ui/button";
 import { api } from "@/lib/api";
 import { DashboardStats, STATUS_COLORS } from "@/lib/types";
 import { CallNowCard } from "@/components/dashboard/call-now-card";
+import { useCallSubscriber } from "@/hooks/use-call-subscriber";
 
 export default function DashboardPage() {
   const [stats, setStats] = useState<DashboardStats | null>(null);
   const [loading, setLoading] = useState(true);
+  const { callSubscriber, callingId } = useCallSubscriber();
 
   useEffect(() => {
     api.getDashboard().then((data) => {
@@ -71,6 +74,7 @@ export default function DashboardPage() {
                     <TableHead>Subscriber</TableHead>
                     <TableHead>Response</TableHead>
                     <TableHead>Date</TableHead>
+                    <TableHead className="w-24"></TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>
@@ -84,6 +88,16 @@ export default function DashboardPage() {
                       </TableCell>
                       <TableCell className="text-sm text-gray-500">
                         {new Date(call.created_at).toLocaleDateString()}
+                      </TableCell>
+                      <TableCell>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          disabled={callingId === call.subscriber_id}
+                          onClick={() => callSubscriber(call.subscriber_id, call.subscriber_name)}
+                        >
+                          {callingId === call.subscriber_id ? "..." : "Call"}
+                        </Button>
                       </TableCell>
                     </TableRow>
                   ))}

@@ -34,6 +34,7 @@ import {
   STATUS_COLORS,
   LANGUAGES,
 } from "@/lib/types";
+import { useCallSubscriber } from "@/hooks/use-call-subscriber";
 
 const EMPTY_FORM = {
   name: "",
@@ -54,6 +55,7 @@ export default function SubscribersPage() {
   const [dialogOpen, setDialogOpen] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [form, setForm] = useState(EMPTY_FORM);
+  const { callSubscriber, callingId } = useCallSubscriber();
 
   const load = useCallback(() => {
     const params: Record<string, unknown> = { page, limit: 20 };
@@ -230,6 +232,15 @@ export default function SubscribersPage() {
                 </TableCell>
                 <TableCell>
                   <div className="flex gap-2">
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className="text-green-700"
+                      disabled={callingId === sub.id}
+                      onClick={() => callSubscriber(sub.id, sub.name)}
+                    >
+                      {callingId === sub.id ? "..." : "Call"}
+                    </Button>
                     <Button variant="ghost" size="sm" onClick={() => openEdit(sub)}>
                       Edit
                     </Button>
