@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import json
 import logging
 from typing import AsyncGenerator, Optional
@@ -7,9 +8,18 @@ import websockets
 
 logger = logging.getLogger(__name__)
 
+PING_INTERVAL_SEC = 30
+
 
 class SarvamTTSClient:
-    """Streaming text-to-speech via Sarvam AI WebSocket."""
+    """
+    Streaming text-to-speech via Sarvam AI WebSocket.
+
+    Protocol: https://docs.sarvam.ai/api-reference-docs/text-to-speech-streaming/stream
+      → Client sends: config, text, flush, ping (all JSON)
+      → Server sends: {"type":"audio","data":{"audio":"<base64-mulaw>"}}  (audio chunks)
+                      {"type":"events","data":{"event_type":"final", ...}} (completion)
+    """
 
     WS_URL = "wss://api.sarvam.ai/text-to-speech/ws"
 
@@ -21,6 +31,7 @@ class SarvamTTSClient:
         self._is_open = False
         self._audio_queue: asyncio.Queue[Optional[bytes]] = asyncio.Queue()
         self._cancelled = False
+        self._ping_task: Optional[asyncio.Task] = None
 
     @property
     def is_open(self) -> bool:
@@ -32,48 +43,107 @@ class SarvamTTSClient:
         self.ws = await websockets.connect(self.WS_URL, additional_headers=headers)
         self._is_open = True
 
+        # Correct Sarvam TTS config field names — see docs.
         config = {
             "type": "config",
             "data": {
-                "model": "bulbul:v3",
                 "target_language_code": self.language,
                 "speaker": self.voice,
-                "encoding": "mulaw",
-                "sample_rate": 8000,
+                "model": "bulbul:v2",
+                "output_audio_codec": "mulaw",
+                "speech_sample_rate": "8000",
+                "min_buffer_size": 50,
+                "send_completion_event": True,
             },
         }
         await self.ws.send(json.dumps(config))
-        logger.info(f"Sarvam TTS connected: lang={self.language}, voice={self.voice}")
+        logger.info(
+            f"Sarvam TTS connected: lang={self.language}, voice={self.voice}, "
+            f"codec=mulaw@8kHz"
+        )
         asyncio.create_task(self._receive_loop())
+        self._ping_task = asyncio.create_task(self._ping_loop())
+
+    async def _ping_loop(self) -> None:
+        """Keep the connection alive — Sarvam closes idle connections after ~60s."""
+        try:
+            while self._is_open:
+                await asyncio.sleep(PING_INTERVAL_SEC)
+                if not self._is_open or not self.ws:
+                    break
+                try:
+                    await self.ws.send(json.dumps({"type": "ping"}))
+                except websockets.ConnectionClosed:
+                    break
+                except Exception as e:
+                    logger.debug(f"TTS ping error: {e}")
+                    break
+        except asyncio.CancelledError:
+            pass
 
     async def _receive_loop(self) -> None:
-        """Background task to receive TTS audio chunks."""
+        """Consume messages from Sarvam TTS and put audio bytes on the queue."""
         try:
             async for message in self.ws:
                 if self._cancelled:
                     continue
-                if isinstance(message, bytes):
-                    await self._audio_queue.put(message)
+
+                # All Sarvam TTS messages are JSON text frames.
+                if not isinstance(message, str):
+                    logger.warning(f"TTS: unexpected binary frame ({len(message)}B)")
+                    continue
+
+                try:
+                    event = json.loads(message)
+                except json.JSONDecodeError:
+                    logger.warning(f"TTS: non-JSON message: {message[:100]}")
+                    continue
+
+                event_type = event.get("type")
+
+                if event_type == "audio":
+                    b64 = event.get("data", {}).get("audio", "")
+                    if b64:
+                        try:
+                            audio_bytes = base64.b64decode(b64)
+                            await self._audio_queue.put(audio_bytes)
+                        except Exception as e:
+                            logger.error(f"TTS: failed to decode audio: {e}")
+
+                elif event_type == "events":
+                    inner_type = event.get("data", {}).get("event_type")
+                    if inner_type == "final":
+                        logger.debug("TTS: completion event (final)")
+                        await self._audio_queue.put(None)
+
+                elif event_type == "error":
+                    err = event.get("data") or event.get("message") or event
+                    logger.error(f"TTS ERROR from Sarvam: {err}")
+                    await self._audio_queue.put(None)
+
                 else:
-                    try:
-                        event = json.loads(message)
-                        if event.get("type") == "end":
-                            await self._audio_queue.put(None)
-                    except json.JSONDecodeError:
-                        pass
-        except websockets.ConnectionClosed:
-            logger.info("Sarvam TTS connection closed")
+                    # Log anything unexpected so we can see it.
+                    logger.debug(f"TTS event: {event_type} -> {str(event)[:200]}")
+
+        except websockets.ConnectionClosed as e:
+            logger.info(f"Sarvam TTS connection closed: code={e.code}, reason={e.reason}")
         except Exception as e:
-            logger.error(f"TTS receive error: {e}")
+            logger.error(f"TTS receive error: {e}", exc_info=True)
         finally:
             self._is_open = False
+            # Unblock any awaiting synthesize() calls.
+            try:
+                self._audio_queue.put_nowait(None)
+            except asyncio.QueueFull:
+                pass
 
     async def synthesize(self, text: str) -> AsyncGenerator[bytes, None]:
         """
-        Send text to TTS and yield mulaw audio chunks as they stream back.
-        Audio is mulaw 8kHz — ready to send directly to Twilio.
+        Send text to TTS; yield mulaw 8kHz audio chunks as they stream back.
+        Audio is ready to send directly to Twilio (after base64 encoding by caller).
         """
         if not self.is_open:
+            logger.warning("TTS synthesize: not open, skipping")
             return
 
         self._cancelled = False
@@ -84,17 +154,31 @@ class SarvamTTSClient:
         except websockets.ConnectionClosed:
             self._is_open = False
             return
+        except Exception as e:
+            logger.error(f"TTS send error: {e}")
+            return
 
+        chunks_yielded = 0
+        bytes_yielded = 0
         while True:
             try:
-                chunk = await asyncio.wait_for(self._audio_queue.get(), timeout=5.0)
+                chunk = await asyncio.wait_for(self._audio_queue.get(), timeout=10.0)
                 if chunk is None:
                     break
                 if self._cancelled:
                     break
+                chunks_yielded += 1
+                bytes_yielded += len(chunk)
                 yield chunk
             except asyncio.TimeoutError:
+                logger.warning(
+                    f"TTS synthesize timeout after {chunks_yielded} chunks"
+                )
                 break
+
+        logger.debug(
+            f"TTS synthesize complete: {chunks_yielded} chunks, {bytes_yielded}B"
+        )
 
     def cancel(self) -> None:
         """Cancel current TTS generation (for barge-in)."""
@@ -107,10 +191,12 @@ class SarvamTTSClient:
 
     async def close(self) -> None:
         """Close the TTS WebSocket connection."""
-        if self.ws and self._is_open:
+        self._is_open = False
+        if self._ping_task and not self._ping_task.done():
+            self._ping_task.cancel()
+        if self.ws:
             try:
                 await self.ws.close()
             except Exception as e:
                 logger.debug(f"TTS close: {e}")
             logger.info("Sarvam TTS disconnected")
-        self._is_open = False

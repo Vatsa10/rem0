@@ -270,9 +270,8 @@ class TwilioSarvamAgent(BaseVoiceAgent):
         """
         async for event in session.stt.receive_events():
             event_type = event.get("type", "")
-            transcript = event.get("transcript", "")
 
-            # Speech start → user is talking, stop agent + cancel pending LLM.
+            # VAD: user started speaking → interrupt agent if speaking.
             if event_type == "speech_start":
                 logger.info("STT: speech_start (user talking)")
                 if session.pending_llm_task and not session.pending_llm_task.done():
@@ -284,22 +283,29 @@ class TwilioSarvamAgent(BaseVoiceAgent):
                     await session.twilio_handler.send_clear(websocket)
                 continue
 
-            if not transcript or not transcript.strip():
+            # VAD: user stopped speaking → final transcript should follow.
+            if event_type == "speech_end":
+                logger.debug("STT: speech_end")
                 continue
 
-            is_final = event_type in ("final", "speech_end") or event.get("is_final")
+            # Transcript event: {"type":"data", "data":{"transcript":"...", ...}}
+            if event_type == "data":
+                data = event.get("data") or {}
+                transcript = (data.get("transcript") or "").strip()
+                if not transcript:
+                    continue
+                is_final = data.get("is_final", True)  # default: treat as final
 
-            if is_final:
-                logger.info(f"STT final transcript: {transcript!r}")
-                if session.pending_llm_task and not session.pending_llm_task.done():
-                    session.pending_llm_task.cancel()
-
-                session.last_partial_text = ""
-                await self._run_turn(session, websocket, transcript, fast=False)
-            else:
-                logger.debug(f"STT partial: {transcript!r}")
-                session.last_partial_text = transcript
-                session.last_partial_time = time.monotonic()
+                if is_final:
+                    logger.info(f"STT final transcript: {transcript!r}")
+                    if session.pending_llm_task and not session.pending_llm_task.done():
+                        session.pending_llm_task.cancel()
+                    session.last_partial_text = ""
+                    await self._run_turn(session, websocket, transcript, fast=False)
+                else:
+                    logger.debug(f"STT partial: {transcript!r}")
+                    session.last_partial_text = transcript
+                    session.last_partial_time = time.monotonic()
 
     async def _run_turn(
         self,

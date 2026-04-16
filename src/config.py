@@ -6,60 +6,66 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
+# Sarvam bulbul:v2 voices (as of Apr 2026):
+# Female: anushka, manisha, vidya, arya, ritu, priya, neha, pooja, simran,
+#         kavya, ishita, shreya, roopa, tanya, shruti, suhani, kavitha, rupali
+# Male:   abhilash, hitesh, aditya, rahul, rohan, amit, dev, varun, manan,
+#         sumit, kabir, aayan, shubh, ashutosh, advait, anand, tarun, sunny,
+#         mani, gokul, vijay, mohit, rehan, soham
 LANGUAGE_CONFIGS = {
     "hi-IN": {
         "stt_code": "hi-IN",
-        "tts_voice": "meera",
+        "tts_voice": "anushka",
         "llm_hint": "Respond in Hindi (Devanagari script). Keep responses conversational and natural.",
     },
     "gu-IN": {
         "stt_code": "gu-IN",
-        "tts_voice": "nisha",
+        "tts_voice": "anushka",
         "llm_hint": "Respond in Gujarati (Gujarati script). Keep responses conversational and natural.",
     },
     "en-IN": {
         "stt_code": "en-IN",
-        "tts_voice": "arvind",
+        "tts_voice": "anushka",
         "llm_hint": "Respond in English with an Indian conversational style.",
     },
     "ta-IN": {
         "stt_code": "ta-IN",
-        "tts_voice": "meera",
+        "tts_voice": "anushka",
         "llm_hint": "Respond in Tamil (Tamil script). Keep responses conversational and natural.",
     },
     "te-IN": {
         "stt_code": "te-IN",
-        "tts_voice": "meera",
+        "tts_voice": "anushka",
         "llm_hint": "Respond in Telugu (Telugu script). Keep responses conversational and natural.",
     },
     "bn-IN": {
         "stt_code": "bn-IN",
-        "tts_voice": "meera",
+        "tts_voice": "anushka",
         "llm_hint": "Respond in Bengali (Bengali script). Keep responses conversational and natural.",
     },
     "mr-IN": {
         "stt_code": "mr-IN",
-        "tts_voice": "meera",
+        "tts_voice": "anushka",
         "llm_hint": "Respond in Marathi (Devanagari script). Keep responses conversational and natural.",
     },
     "kn-IN": {
         "stt_code": "kn-IN",
-        "tts_voice": "meera",
+        "tts_voice": "anushka",
         "llm_hint": "Respond in Kannada (Kannada script). Keep responses conversational and natural.",
     },
     "ml-IN": {
         "stt_code": "ml-IN",
-        "tts_voice": "meera",
+        "tts_voice": "anushka",
         "llm_hint": "Respond in Malayalam (Malayalam script). Keep responses conversational and natural.",
     },
     "pa-IN": {
         "stt_code": "pa-IN",
-        "tts_voice": "meera",
+        "tts_voice": "anushka",
         "llm_hint": "Respond in Punjabi (Gurmukhi script). Keep responses conversational and natural.",
     },
     "od-IN": {
         "stt_code": "od-IN",
-        "tts_voice": "meera",
+        "tts_voice": "anushka",
         "llm_hint": "Respond in Odia (Odia script). Keep responses conversational and natural.",
     },
 }

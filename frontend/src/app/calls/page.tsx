@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { Fragment, useCallback, useEffect, useState } from "react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -85,7 +85,7 @@ export default function CallsPage() {
           </TableHeader>
           <TableBody>
             {data?.items.map((call) => (
-              <>
+              <Fragment key={call.call_id}>
                 <TableRow
                   key={call.call_id}
                   className="cursor-pointer hover:bg-gray-50"
@@ -185,7 +185,7 @@ export default function CallsPage() {
                     </TableCell>
                   </TableRow>
                 )}
-              </>
+              </Fragment>
             ))}
             {data?.items.length === 0 && (
               <TableRow>
