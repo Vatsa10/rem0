@@ -68,6 +68,15 @@ class TwilioSarvamAgent(BaseVoiceAgent):
         self.greeting_cache = get_greeting_cache()
         self._shared_llm: Optional[LLMClient] = None
 
+    async def _safe_task(self, name: str, coro) -> None:
+        """Wrap a task coroutine to log exceptions instead of swallowing them."""
+        try:
+            await coro
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"Task {name!r} failed: {e}", exc_info=True)
+
     def _get_shared_llm(self) -> LLMClient:
         """Single LLMClient across all calls — reuses HTTP/2 connection pool."""
         if self._shared_llm is None:
@@ -200,10 +209,10 @@ class TwilioSarvamAgent(BaseVoiceAgent):
                 await session.tts.connect()
 
             stt_task = asyncio.create_task(
-                self._process_stt_events(session, websocket)
+                self._safe_task("stt_events", self._process_stt_events(session, websocket))
             )
             greeting_task = asyncio.create_task(
-                self._send_greeting(session, websocket)
+                self._safe_task("greeting", self._send_greeting(session, websocket))
             )
 
             await self._receive_twilio_audio(session, websocket)
@@ -235,11 +244,11 @@ class TwilioSarvamAgent(BaseVoiceAgent):
                     if mulaw_audio:
                         pcm_audio = mulaw_to_pcm(mulaw_audio)
                         await session.stt.send_audio(pcm_audio)
-
-                        if session.conversation.is_agent_speaking:
-                            session.conversation.handle_barge_in()
-                            session.tts.cancel()
-                            await handler.send_clear(websocket)
+                        # Barge-in is handled in _process_stt_events on the
+                        # STT speech_start event (real speech, not silence).
+                        # DO NOT cancel TTS here — Twilio sends audio frames
+                        # constantly, including silence, which would interrupt
+                        # the agent immediately after it starts speaking.
 
                 elif event == "stop":
                     break
@@ -265,9 +274,11 @@ class TwilioSarvamAgent(BaseVoiceAgent):
 
             # Speech start → user is talking, stop agent + cancel pending LLM.
             if event_type == "speech_start":
+                logger.info("STT: speech_start (user talking)")
                 if session.pending_llm_task and not session.pending_llm_task.done():
                     session.pending_llm_task.cancel()
                 if session.conversation.is_agent_speaking:
+                    logger.info("Barge-in — cancelling agent speech")
                     session.conversation.handle_barge_in()
                     session.tts.cancel()
                     await session.twilio_handler.send_clear(websocket)
@@ -279,14 +290,14 @@ class TwilioSarvamAgent(BaseVoiceAgent):
             is_final = event_type in ("final", "speech_end") or event.get("is_final")
 
             if is_final:
-                # Cancel any in-flight speculation and start authoritative turn.
+                logger.info(f"STT final transcript: {transcript!r}")
                 if session.pending_llm_task and not session.pending_llm_task.done():
                     session.pending_llm_task.cancel()
 
                 session.last_partial_text = ""
                 await self._run_turn(session, websocket, transcript, fast=False)
             else:
-                # Interim / partial — track for speculation.
+                logger.debug(f"STT partial: {transcript!r}")
                 session.last_partial_text = transcript
                 session.last_partial_time = time.monotonic()
 
@@ -299,6 +310,7 @@ class TwilioSarvamAgent(BaseVoiceAgent):
     ) -> None:
         """Generate + speak the agent's response for one turn."""
         messages = session.conversation.build_messages(user_text)
+        logger.info(f"LLM turn starting (fast={fast}, user={user_text!r})")
 
         full_response = ""
         session.conversation.is_agent_speaking = True
@@ -320,6 +332,8 @@ class TwilioSarvamAgent(BaseVoiceAgent):
             remaining = session.conversation.flush_accumulated()
             if remaining and session.conversation.is_agent_speaking:
                 await self._speak(session, websocket, remaining)
+
+            logger.info(f"LLM turn complete: {full_response!r}")
 
             if full_response:
                 session.conversation.record_agent_turn(full_response)
@@ -365,6 +379,7 @@ class TwilioSarvamAgent(BaseVoiceAgent):
             return
 
         # Slow path: live generation. Use fast model for low TTFT.
+        logger.info(f"Generating live greeting for {session.subscriber.name}")
         greeting_prompt = (
             "[SYSTEM: Call connected. Deliver your opening greeting — "
             "introduce yourself and the company, and confirm the subscriber's name. Keep it to one sentence.]"
@@ -375,6 +390,7 @@ class TwilioSarvamAgent(BaseVoiceAgent):
 
         full_response = ""
         collected_audio = bytearray()
+        total_audio_sent = 0
         session.conversation.is_agent_speaking = True
 
         try:
@@ -385,20 +401,29 @@ class TwilioSarvamAgent(BaseVoiceAgent):
                 fast=True,
             ):
                 if not session.conversation.is_agent_speaking:
+                    logger.info("Greeting interrupted mid-generation")
                     break
                 chunk = session.conversation.accumulate_token(token)
                 full_response += token
                 if chunk:
+                    logger.info(f"Greeting chunk to TTS: {chunk!r}")
                     async for audio in session.tts.synthesize(chunk):
                         collected_audio.extend(audio)
                         if session.conversation.is_agent_speaking:
                             await session.twilio_handler.send_audio(websocket, audio)
+                            total_audio_sent += len(audio)
 
             remaining = session.conversation.flush_accumulated()
             if remaining and session.conversation.is_agent_speaking:
+                logger.info(f"Greeting final chunk to TTS: {remaining!r}")
                 async for audio in session.tts.synthesize(remaining):
                     collected_audio.extend(audio)
                     await session.twilio_handler.send_audio(websocket, audio)
+                    total_audio_sent += len(audio)
+
+            logger.info(
+                f"Greeting done: text={full_response!r}, audio_sent={total_audio_sent}B"
+            )
 
             if full_response:
                 # Replace the fake greeting-prompt with the actual response in history.
@@ -427,12 +452,15 @@ class TwilioSarvamAgent(BaseVoiceAgent):
     ) -> None:
         """Send text to TTS and stream audio back to Twilio."""
         mark_id = str(uuid.uuid4())[:8]
+        sent = 0
 
         async for audio_chunk in session.tts.synthesize(text):
             if not session.conversation.is_agent_speaking:
                 break
             await session.twilio_handler.send_audio(websocket, audio_chunk)
+            sent += len(audio_chunk)
 
+        logger.debug(f"Spoke: {text!r} ({sent}B)")
         await session.twilio_handler.send_mark(websocket, mark_id)
 
     async def _cleanup_session(self, session: CallSession, call_id: str) -> None:
