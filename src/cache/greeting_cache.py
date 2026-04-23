@@ -12,9 +12,10 @@ class GreetingCache:
     """
     Redis-backed cache for pre-synthesized greeting audio.
 
-    Stores mulaw 8kHz audio keyed by (language, voice, company, agent).
-    Voice is part of the key so changing the voice doesn't serve stale audio
-    from a previous (possibly different-gender) voice.
+    Stores mulaw 8kHz audio keyed by (language, voice, time_period, company, agent).
+    - `voice` differentiation prevents a male/female mismatch.
+    - `time_period` differentiation prevents serving a "good morning" greeting
+      at 8 PM. Typical values: morning / afternoon / evening / late.
     """
 
     def __init__(self, url: str = "redis://localhost:6379/0"):
@@ -40,62 +41,67 @@ class GreetingCache:
             await self._client.close()
             self._client = None
 
-    def _key(self, language: str, voice: str, company: str, agent: str) -> str:
+    def _key(
+        self, language: str, voice: str, time_period: str, company: str, agent: str
+    ) -> str:
         h = hashlib.md5(f"{company}|{agent}".encode()).hexdigest()[:8]
-        return f"greeting:v2:{language}:{voice}:{h}"
+        return f"greeting:v3:{language}:{voice}:{time_period}:{h}"
 
     async def get(
-        self, language: str, voice: str, company: str, agent: str
+        self, language: str, voice: str, time_period: str, company: str, agent: str
     ) -> Optional[bytes]:
         """Get cached greeting audio (mulaw 8kHz). Returns None if not cached."""
         if not self._client:
             return None
         try:
-            return await self._client.get(self._key(language, voice, company, agent))
+            return await self._client.get(
+                self._key(language, voice, time_period, company, agent)
+            )
         except Exception as e:
             logger.warning(f"Cache get failed: {e}")
             return None
 
     async def set(
-        self, language: str, voice: str, company: str, agent: str, audio: bytes,
-        ttl_seconds: int = 86400 * 7,
+        self, language: str, voice: str, time_period: str, company: str, agent: str,
+        audio: bytes, ttl_seconds: int = 86400 * 7,
     ) -> None:
         """Cache greeting audio with 7-day TTL by default."""
         if not self._client:
             return
         try:
             await self._client.set(
-                self._key(language, voice, company, agent),
+                self._key(language, voice, time_period, company, agent),
                 audio,
                 ex=int(ttl_seconds),
             )
             logger.info(
-                f"Cached greeting: lang={language}, voice={voice}, bytes={len(audio)}"
+                f"Cached greeting: lang={language}, voice={voice}, "
+                f"period={time_period}, bytes={len(audio)}"
             )
         except Exception as e:
             logger.warning(f"Cache set failed: {e}")
 
     async def get_text(
-        self, language: str, voice: str, company: str, agent: str
+        self, language: str, voice: str, time_period: str, company: str, agent: str
     ) -> Optional[str]:
         """Get the text that was used to generate the cached greeting."""
         if not self._client:
             return None
         try:
-            key = self._key(language, voice, company, agent) + ":text"
+            key = self._key(language, voice, time_period, company, agent) + ":text"
             val = await self._client.get(key)
             return val.decode("utf-8") if val else None
         except Exception:
             return None
 
     async def set_text(
-        self, language: str, voice: str, company: str, agent: str, text: str,
-        ttl_seconds: int = 86400 * 7,
+        self, language: str, voice: str, time_period: str, company: str, agent: str,
+        text: str, ttl_seconds: int = 86400 * 7,
     ) -> None:
         if not self._client:
             return
         try:
-            key = self._key(language, voice, company, agent) + ":text"
+            key = self._key(language, voice, time_period, company, agent) + ":text"
             await self._client.set(key, text.encode("utf-8"), ex=int(ttl_seconds))
         except Exception:
             pass

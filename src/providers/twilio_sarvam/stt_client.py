@@ -49,7 +49,7 @@ class SarvamSTTClient:
         language: str,
         api_key: str,
         model: str = "saaras:v3",
-        sample_rate: int = 8000,
+        sample_rate: int = 8000,  # telephony — matches Twilio's 8 kHz mulaw stream
     ):
         self.language = language
         self.api_key = api_key
@@ -124,9 +124,21 @@ class SarvamSTTClient:
                 if event_type == "error":
                     logger.error(f"STT ERROR from Sarvam: {event}")
                 else:
-                    # INFO level so we can see exactly which VAD/transcript
-                    # events Sarvam is actually emitting for a given call.
                     logger.info(f"STT raw event: {event_type} -> {str(event)[:200]}")
+
+                # Normalize Sarvam's VAD signals into a flat form the agent
+                # loop can pattern-match on.
+                # Sarvam emits: {"type":"events","data":{"signal_type":"START_SPEECH"|"END_SPEECH"}}
+                if event_type == "events":
+                    signal = (event.get("data") or {}).get("signal_type", "")
+                    if signal == "START_SPEECH":
+                        await self._event_queue.put({"type": "speech_start"})
+                        continue
+                    if signal == "END_SPEECH":
+                        await self._event_queue.put({"type": "speech_end"})
+                        continue
+                    # Unknown signal — pass through for logging/inspection.
+
                 await self._event_queue.put(event)
         except websockets.ConnectionClosed as e:
             logger.info(f"Sarvam STT connection closed: code={e.code}, reason={e.reason}")

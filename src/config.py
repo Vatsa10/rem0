@@ -6,64 +6,71 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
-# Sarvam bulbul:v2 WebSocket TTS voices (April 2026):
-# Female: anushka, manisha, vidya, arya
-# Male:   abhilash, hitesh, karun
-# (bulbul:v3 has 40+ voices but the WS endpoint currently forces v2)
+# Sarvam bulbul:v3 WebSocket TTS voices (verified from API, April 2026).
+# Docs: https://docs.sarvam.ai/api-reference-docs/text-to-speech/stream
+# Model is activated via ?model=bulbul:v3 query param on the WS URL.
+#
+# Female: priya, neha, pooja, ritu, simran, kavya, ishita, shreya, roopa,
+#         tanya, shruti, suhani, kavitha, rupali, niharika
+# Male:   rohan, aditya, rahul, amit, dev, varun, manan, sumit, kabir, aayan,
+#         shubh, ashutosh, advait, anand, tarun, sunny, mani, gokul, vijay,
+#         mohit, rehan, soham
+#
+# NOT in v3 (v2-only): anushka, abhilash, manisha, vidya, arya, karun, hitesh
 LANGUAGE_CONFIGS = {
     "hi-IN": {
         "stt_code": "hi-IN",
-        "tts_voice": "anushka",
+        "tts_voice": "priya",
         "llm_hint": "Respond in Hindi (Devanagari script). Keep responses conversational and natural.",
     },
     "gu-IN": {
         "stt_code": "gu-IN",
-        "tts_voice": "anushka",
+        "tts_voice": "priya",
         "llm_hint": "Respond in Gujarati (Gujarati script). Keep responses conversational and natural.",
     },
     "en-IN": {
         "stt_code": "en-IN",
-        "tts_voice": "hitesh",
+        "tts_voice": "rohan",
         "llm_hint": "Respond in English with an Indian conversational style.",
     },
     "ta-IN": {
         "stt_code": "ta-IN",
-        "tts_voice": "anushka",
+        "tts_voice": "priya",
         "llm_hint": "Respond in Tamil (Tamil script). Keep responses conversational and natural.",
     },
     "te-IN": {
         "stt_code": "te-IN",
-        "tts_voice": "anushka",
+        "tts_voice": "priya",
         "llm_hint": "Respond in Telugu (Telugu script). Keep responses conversational and natural.",
     },
     "bn-IN": {
         "stt_code": "bn-IN",
-        "tts_voice": "anushka",
+        "tts_voice": "priya",
         "llm_hint": "Respond in Bengali (Bengali script). Keep responses conversational and natural.",
     },
     "mr-IN": {
         "stt_code": "mr-IN",
-        "tts_voice": "anushka",
+        "tts_voice": "priya",
         "llm_hint": "Respond in Marathi (Devanagari script). Keep responses conversational and natural.",
     },
     "kn-IN": {
         "stt_code": "kn-IN",
-        "tts_voice": "anushka",
+        "tts_voice": "priya",
         "llm_hint": "Respond in Kannada (Kannada script). Keep responses conversational and natural.",
     },
     "ml-IN": {
         "stt_code": "ml-IN",
-        "tts_voice": "anushka",
+        "tts_voice": "priya",
         "llm_hint": "Respond in Malayalam (Malayalam script). Keep responses conversational and natural.",
     },
     "pa-IN": {
         "stt_code": "pa-IN",
-        "tts_voice": "anushka",
+        "tts_voice": "priya",
         "llm_hint": "Respond in Punjabi (Gurmukhi script). Keep responses conversational and natural.",
     },
     "od-IN": {
         "stt_code": "od-IN",
-        "tts_voice": "anushka",
+        "tts_voice": "priya",
         "llm_hint": "Respond in Odia (Odia script). Keep responses conversational and natural.",
     },
 }

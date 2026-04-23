@@ -23,10 +23,17 @@ class SarvamTTSClient:
 
     WS_URL = "wss://api.sarvam.ai/text-to-speech/ws"
 
-    def __init__(self, language: str, voice: str, api_key: str):
+    def __init__(
+        self,
+        language: str,
+        voice: str,
+        api_key: str,
+        model: str = "bulbul:v3",
+    ):
         self.language = language
         self.voice = voice
         self.api_key = api_key
+        self.model = model
         self.ws = None
         self._is_open = False
         self._audio_queue: asyncio.Queue[Optional[bytes]] = asyncio.Queue()
@@ -45,11 +52,14 @@ class SarvamTTSClient:
         so callers can react (skip greeting / end call / mark invalid).
         """
         headers = {"api-subscription-key": self.api_key}
+        # Model is selected via URL query param (the in-config `model` field
+        # is silently ignored by the WS endpoint — see probe results).
+        url = f"{self.WS_URL}?model={self.model}"
         last_error: Optional[Exception] = None
         for attempt in range(1, retries + 2):  # retries=2 → 3 attempts total
             try:
                 self.ws = await websockets.connect(
-                    self.WS_URL,
+                    url,
                     additional_headers=headers,
                     open_timeout=open_timeout,
                 )
@@ -67,10 +77,20 @@ class SarvamTTSClient:
 
         self._is_open = True
 
-        # Sarvam TTS WS config — the WS endpoint uses bulbul:v2 by default
-        # (the model field is ignored). bulbul:v2 supports these voices:
-        # Female: anushka, manisha, vidya, arya
-        # Male:   abhilash, hitesh, karun
+        # Sarvam TTS WS config. Model (bulbul:v3) is set via URL query param
+        # above — the `model` field in the config body is silently ignored
+        # by the WS endpoint. v3 supports 40+ voices (rohan, aditya, ritu,
+        # priya, neha, etc.) and uses `temperature` (0.01–1.0) for control.
+        #
+        # Audio format — telephony-optimized for Twilio:
+        #   output_audio_codec = "mulaw" — Twilio's native codec (zero conversion)
+        #   speech_sample_rate = "8000"  — telephony standard, matches Twilio's
+        #                                   mulaw stream byte-for-byte
+        # Docs: https://docs.sarvam.ai/api-reference-docs/api-guides-tutorials/
+        #       text-to-speech/how-to/set-the-sample-rate
+        # Higher rates (16k/22.05k/24k) would sound crisper in HiFi but Twilio
+        # resamples to 8k mulaw anyway — so we'd burn TTS cost + downsampling
+        # artifacts for no gain on a phone call.
         config = {
             "type": "config",
             "data": {
@@ -78,6 +98,7 @@ class SarvamTTSClient:
                 "speaker": self.voice,
                 "output_audio_codec": "mulaw",
                 "speech_sample_rate": "8000",
+                "temperature": 0.5,
                 "min_buffer_size": 50,
                 "send_completion_event": True,
             },
@@ -85,7 +106,7 @@ class SarvamTTSClient:
         await self.ws.send(json.dumps(config))
         logger.info(
             f"Sarvam TTS connected: lang={self.language}, voice={self.voice}, "
-            f"codec=mulaw@8kHz"
+            f"model={self.model}, codec=mulaw@8kHz"
         )
         asyncio.create_task(self._receive_loop())
         self._ping_task = asyncio.create_task(self._ping_loop())

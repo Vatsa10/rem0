@@ -77,6 +77,18 @@ class TwilioSarvamAgent(BaseVoiceAgent):
         except Exception as e:
             logger.error(f"Task {name!r} failed: {e}", exc_info=True)
 
+    @staticmethod
+    def _log_task_exception(task: asyncio.Task) -> None:
+        """
+        Done-callback for create_task so exceptions surface instead of being
+        silently swallowed when the task isn't explicitly awaited.
+        """
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc:
+            logger.error(f"Task failed: {exc!r}", exc_info=exc)
+
     def _get_shared_llm(self) -> LLMClient:
         """Single LLMClient across all calls — reuses HTTP/2 connection pool."""
         if self._shared_llm is None:
@@ -159,6 +171,7 @@ class TwilioSarvamAgent(BaseVoiceAgent):
         """
         lang = session.subscriber.language
         voice = session.tts.voice
+        period = self._time_period()
         try:
             await self.greeting_cache.connect()
 
@@ -167,7 +180,8 @@ class TwilioSarvamAgent(BaseVoiceAgent):
                 session.stt.connect(),
                 session.tts.connect(),
                 self.greeting_cache.get(
-                    lang, voice, self.config.company_name, self.config.agent_name
+                    lang, voice, period,
+                    self.config.company_name, self.config.agent_name,
                 ),
                 return_exceptions=True,
             )
@@ -189,16 +203,17 @@ class TwilioSarvamAgent(BaseVoiceAgent):
             if isinstance(greeting, bytes):
                 session.cached_greeting = greeting
                 session.cached_greeting_text = await self.greeting_cache.get_text(
-                    lang, voice, self.config.company_name, self.config.agent_name
+                    lang, voice, period,
+                    self.config.company_name, self.config.agent_name,
                 )
                 logger.info(
                     f"Pre-warm complete with cached greeting "
-                    f"({len(greeting)} bytes, voice={voice}) "
+                    f"({len(greeting)} bytes, voice={voice}, period={period}) "
                     f"for call_sid={session.call_sid}"
                 )
             else:
                 logger.info(
-                    f"Pre-warm complete (no cached greeting) "
+                    f"Pre-warm complete (no cached greeting, period={period}) "
                     f"stt_ok={not isinstance(stt_result, Exception)} "
                     f"tts_ok={not isinstance(tts_result, Exception)} "
                     f"for call_sid={session.call_sid}"
@@ -292,16 +307,24 @@ class TwilioSarvamAgent(BaseVoiceAgent):
         """
         Interrupt any in-flight agent response.
 
-        Idempotent — safe to call multiple times in a row. If the agent
-        isn't currently speaking, this is a no-op aside from the log.
+        Cancels the pending LLM turn task (kills generation) and, if the
+        agent is mid-utterance, stops the TTS stream and flushes Twilio's
+        audio buffer so the caller hears the interruption take effect.
+
+        Idempotent — safe to call multiple times.
         """
+        cancelled_turn = False
         if session.pending_llm_task and not session.pending_llm_task.done():
             session.pending_llm_task.cancel()
+            cancelled_turn = True
+
         if session.conversation.is_agent_speaking:
             logger.info(f"Barge-in [{reason}] — cancelling agent speech")
             session.conversation.handle_barge_in()
             session.tts.cancel()
             await session.twilio_handler.send_clear(websocket)
+        elif cancelled_turn:
+            logger.info(f"Barge-in [{reason}] — cancelled pending LLM turn (pre-speak)")
 
     async def _process_stt_events(
         self, session: CallSession, websocket: WebSocket
@@ -346,9 +369,32 @@ class TwilioSarvamAgent(BaseVoiceAgent):
                 if is_final:
                     logger.info(f"STT final transcript: {transcript!r}")
                     session.last_partial_text = ""
-                    # Use _run_turn's default (fast=True → 8B instant model)
-                    # for low latency; 8B is plenty for our short replies.
-                    await self._run_turn(session, websocket, transcript)
+
+                    # Cancel any in-flight turn — the caller has said
+                    # something new, superseding whatever we were working on.
+                    if (
+                        session.pending_llm_task
+                        and not session.pending_llm_task.done()
+                    ):
+                        logger.info(
+                            "Cancelling previous turn for new transcript"
+                        )
+                        session.pending_llm_task.cancel()
+
+                    # Run the turn as a BACKGROUND TASK so this event loop
+                    # keeps polling STT — so we can detect barge-ins that
+                    # happen during LLM generation / TTS streaming. Awaiting
+                    # _run_turn inline would block this loop and make mid-turn
+                    # barge-ins invisible until the turn finished.
+                    #
+                    # Direct create_task (no _safe_task wrapper) avoids the
+                    # "coroutine was never awaited" warning when a task is
+                    # cancelled in the same tick it's created.
+                    turn_task = asyncio.create_task(
+                        self._run_turn(session, websocket, transcript)
+                    )
+                    turn_task.add_done_callback(self._log_task_exception)
+                    session.pending_llm_task = turn_task
                 else:
                     logger.info(f"STT partial: {transcript!r}")
                     session.last_partial_text = transcript
@@ -467,10 +513,14 @@ class TwilioSarvamAgent(BaseVoiceAgent):
 
         # Slow path: full-response-then-speak.
         logger.info(f"Generating live greeting for {session.subscriber.name}")
+        period = self._time_period()
+        # 'late' (midnight–5 AM) is unusual — skip the time-of-day phrase then.
+        time_greeting = f"good {period}" if period != "late" else "hello"
         greeting_prompt = (
-            "[SYSTEM: Call connected. Say one short sentence: greet by name, "
-            f"say who you are from {self.config.company_name}, "
-            f"ask 'is this {session.subscriber.name}?'. MAX 15 WORDS.]"
+            "[SYSTEM: Call connected. Open with ONE warm, natural line like: "
+            f"\"Hi, {time_greeting}, am I speaking to Mr. {session.subscriber.name}?\". "
+            "Use that exact shape. Don't introduce the company yet — save that "
+            "for after they confirm. MAX 15 WORDS.]"
         )
         session.conversation.message_history.append(
             {"role": "user", "content": greeting_prompt}
@@ -536,6 +586,7 @@ class TwilioSarvamAgent(BaseVoiceAgent):
                 await self.greeting_cache.set(
                     session.subscriber.language,
                     session.tts.voice,
+                    period,
                     self.config.company_name,
                     self.config.agent_name,
                     bytes(collected_audio),
@@ -543,6 +594,7 @@ class TwilioSarvamAgent(BaseVoiceAgent):
                 await self.greeting_cache.set_text(
                     session.subscriber.language,
                     session.tts.voice,
+                    period,
                     self.config.company_name,
                     self.config.agent_name,
                     heard,
@@ -554,6 +606,23 @@ class TwilioSarvamAgent(BaseVoiceAgent):
     _TWILIO_BYTES_PER_SEC = 8000
     _WORDS_PER_SEC = 2.5
     _TWILIO_PLAYBACK_BUFFER_SEC = 0.08  # frames in Twilio buffer, cleared on barge-in
+
+    @staticmethod
+    def _time_period(hour: Optional[int] = None) -> str:
+        """
+        Return 'morning' / 'afternoon' / 'evening' / 'late' based on the hour.
+        Used both for spoken greeting phrasing and as a cache-key discriminator
+        so a morning-recorded greeting isn't reused in the evening.
+        """
+        from datetime import datetime
+        h = datetime.now().hour if hour is None else hour
+        if 5 <= h < 12:
+            return "morning"
+        if 12 <= h < 17:
+            return "afternoon"
+        if 17 <= h < 22:
+            return "evening"
+        return "late"
 
     def _estimate_heard_text(self, text: str, bytes_sent: int) -> str:
         """
