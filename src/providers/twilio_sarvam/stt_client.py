@@ -68,8 +68,8 @@ class SarvamSTTClient:
     def is_open(self) -> bool:
         return self._is_open and self.ws is not None
 
-    async def connect(self) -> None:
-        """Open WebSocket with query params + auth header."""
+    async def connect(self, open_timeout: float = 5.0, retries: int = 2) -> None:
+        """Open WebSocket with bounded timeout and retry."""
         url = (
             f"{self.WS_URL}"
             f"?language-code={self.language}"
@@ -79,7 +79,25 @@ class SarvamSTTClient:
             f"&high_vad_sensitivity=true"
         )
         headers = {"api-subscription-key": self.api_key}
-        self.ws = await websockets.connect(url, additional_headers=headers)
+        last_error: Optional[Exception] = None
+        for attempt in range(1, retries + 2):
+            try:
+                self.ws = await websockets.connect(
+                    url,
+                    additional_headers=headers,
+                    open_timeout=open_timeout,
+                )
+                break
+            except Exception as e:
+                last_error = e
+                logger.warning(
+                    f"Sarvam STT connect attempt {attempt} failed: {e!r}"
+                )
+                if attempt < retries + 1:
+                    await asyncio.sleep(0.3 * attempt)
+        else:
+            raise last_error or TimeoutError("STT connect failed")
+
         self._is_open = True
         logger.info(
             f"Sarvam STT connected: lang={self.language}, model={self.model}, "

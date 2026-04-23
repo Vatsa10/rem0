@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 from typing import Optional
@@ -25,6 +26,18 @@ class TwilioMediaStreamHandler:
 
     def __init__(self):
         self.state = TwilioStreamState()
+        # Set once Twilio sends the `start` event (gives us stream_sid).
+        # Producers must await this before calling send_audio/send_mark/send_clear
+        # — otherwise send calls silently drop because stream_sid is None.
+        self._ready_event = asyncio.Event()
+
+    async def wait_until_ready(self, timeout: float = 5.0) -> bool:
+        """Block until the `start` event has been seen (stream_sid available)."""
+        try:
+            await asyncio.wait_for(self._ready_event.wait(), timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            return False
 
     def parse_message(self, raw_message: str) -> dict:
         """Parse a Twilio WebSocket message and update state."""
@@ -41,6 +54,7 @@ class TwilioMediaStreamHandler:
             self.state.call_sid = start_data.get("callSid")
             self.state.account_sid = start_data.get("accountSid")
             self.state.custom_parameters = start_data.get("customParameters", {})
+            self._ready_event.set()
             logger.info(
                 f"Twilio stream started: stream_sid={self.state.stream_sid}, "
                 f"call_sid={self.state.call_sid}"

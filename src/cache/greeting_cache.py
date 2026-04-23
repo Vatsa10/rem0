@@ -13,7 +13,8 @@ class GreetingCache:
     Redis-backed cache for pre-synthesized greeting audio.
 
     Stores mulaw 8kHz audio keyed by (language, voice, company, agent).
-    Voice is part of the key so changing the voice doesn't serve stale audio.
+    Voice is part of the key so changing the voice doesn't serve stale audio
+    from a previous (possibly different-gender) voice.
     """
 
     def __init__(self, url: str = "redis://localhost:6379/0"):
@@ -64,7 +65,9 @@ class GreetingCache:
             return
         try:
             await self._client.set(
-                self._key(language, voice, company, agent), audio, ex=ttl_seconds
+                self._key(language, voice, company, agent),
+                audio,
+                ex=int(ttl_seconds),
             )
             logger.info(
                 f"Cached greeting: lang={language}, voice={voice}, bytes={len(audio)}"
@@ -93,7 +96,7 @@ class GreetingCache:
             return
         try:
             key = self._key(language, voice, company, agent) + ":text"
-            await self._client.set(key, text.encode("utf-8"), ex=ttl_seconds)
+            await self._client.set(key, text.encode("utf-8"), ex=int(ttl_seconds))
         except Exception:
             pass
 
