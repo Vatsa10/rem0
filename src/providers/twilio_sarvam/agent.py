@@ -346,7 +346,9 @@ class TwilioSarvamAgent(BaseVoiceAgent):
                 if is_final:
                     logger.info(f"STT final transcript: {transcript!r}")
                     session.last_partial_text = ""
-                    await self._run_turn(session, websocket, transcript, fast=False)
+                    # Use _run_turn's default (fast=True → 8B instant model)
+                    # for low latency; 8B is plenty for our short replies.
+                    await self._run_turn(session, websocket, transcript)
                 else:
                     logger.info(f"STT partial: {transcript!r}")
                     session.last_partial_text = transcript
@@ -357,20 +359,25 @@ class TwilioSarvamAgent(BaseVoiceAgent):
         session: CallSession,
         websocket: WebSocket,
         user_text: str,
-        fast: bool = False,
+        fast: bool = True,
     ) -> None:
         """
-        Full-response-then-speak turn:
+        Full-response-then-speak turn, with state-aware memory.
+
+        Uses the fast model (llama-3.1-8b-instant) by default for low latency —
+        the 8B model is plenty smart for the short, focused replies we ask for.
+
           1. Collect the complete LLM response (no TTS during generation).
           2. Speak it as a single utterance (still interruptible via barge-in).
-          3. Record only what was actually heard.
-
-        This keeps the reply coherent (no chunking artifacts) and makes
-        barge-in behaviour clean — a single atomic utterance either plays
-        fully or is interrupted once.
+          3. Record outcome via record_turn_result — captures both what was
+             generated and what the caller actually heard, plus updates the
+             state machine and barge-in memory for the next turn.
         """
         messages = session.conversation.build_messages(user_text)
-        logger.info(f"LLM turn starting (fast={fast}, user={user_text!r})")
+        logger.info(
+            f"LLM turn starting (fast={fast}, state={session.conversation.state.value}, "
+            f"user={user_text!r})"
+        )
 
         # Phase 1 — collect full LLM response (no audio yet).
         full_response = ""
@@ -394,16 +401,21 @@ class TwilioSarvamAgent(BaseVoiceAgent):
 
         # Phase 2 — speak the complete reply as one utterance.
         session.conversation.is_agent_speaking = True
+        heard = ""
         try:
             _, heard = await self._speak(session, websocket, reply)
             logger.info(f"LLM turn heard: {heard!r}")
-            if heard:
-                session.conversation.record_agent_turn(heard)
         except asyncio.CancelledError:
             logger.debug("Turn cancelled during speak phase")
             raise
         finally:
             session.conversation.is_agent_speaking = False
+            # Always update state + barge-in memory, even on cancellation.
+            session.conversation.record_turn_result(
+                user_text=user_text,
+                generated=reply,
+                heard=heard,
+            )
 
     async def _send_greeting(
         self, session: CallSession, websocket: WebSocket
@@ -444,8 +456,10 @@ class TwilioSarvamAgent(BaseVoiceAgent):
                     await asyncio.sleep(0.08)  # pace to real-time playback
 
                 if session.cached_greeting_text:
-                    session.conversation.record_agent_turn(
-                        session.cached_greeting_text
+                    session.conversation.record_turn_result(
+                        user_text="",
+                        generated=session.cached_greeting_text,
+                        heard=session.cached_greeting_text,
                     )
             finally:
                 session.conversation.is_agent_speaking = False
@@ -507,10 +521,15 @@ class TwilioSarvamAgent(BaseVoiceAgent):
                 f"interrupted={interrupted}"
             )
 
-            # Replace the fake prompt in history with the actual spoken text.
+            # Replace the fake prompt in history with the real turn outcome,
+            # and let record_turn_result update state + barge-in memory.
             session.conversation.message_history.pop(-1)
             if heard:
-                session.conversation.record_agent_turn(heard)
+                session.conversation.record_turn_result(
+                    user_text="",  # greeting has no user text
+                    generated=reply,
+                    heard=heard,
+                )
 
             # Only cache greetings that played fully through (consistent audio ↔ text).
             if not interrupted and collected_audio and heard:

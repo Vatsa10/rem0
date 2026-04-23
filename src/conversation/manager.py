@@ -21,10 +21,30 @@ MIN_PHRASE_WORDS = 6
 
 
 class ConversationState(str, Enum):
-    GREETING = "greeting"
-    ACTIVE = "active"
-    CLOSING = "closing"
+    GREETING = "greeting"                # opening, confirming identity
+    RENEWAL_PITCH = "renewal_pitch"      # delivering the reminder
+    HANDLING_OBJECTION = "handling_objection"  # addressing concerns / questions
+    COLLECTING_PAYMENT = "collecting_payment"  # payment method flow
+    CLOSING = "closing"                  # wrapping up
     ENDED = "ended"
+
+
+# Heuristic state transitions based on what just happened.
+# Runs after each turn; the LLM gets the new state in the next system prompt.
+_STATE_KEYWORDS = {
+    ConversationState.COLLECTING_PAYMENT: [
+        "payment", "upi", "card", "gpay", "paytm", "phonepe", "net banking",
+        "credit", "debit", "pay by", "link",
+    ],
+    ConversationState.CLOSING: [
+        "bye", "thank you", "have a great", "that's all", "talk later",
+        "no thanks",
+    ],
+    ConversationState.HANDLING_OBJECTION: [
+        "why", "how much", "what is", "can i", "do you", "is there",
+        "not interested", "expensive", "too much", "cancel",
+    ],
+}
 
 
 class ConversationManager:
@@ -48,6 +68,18 @@ class ConversationManager:
         self.is_agent_speaking = False
         self._accumulated_text = ""
 
+        # Barge-in / flow memory — populated after every agent turn.
+        # Used to inject a "call state" block into the next system prompt
+        # so the LLM knows what was said, what was cut off, and the current goal.
+        self.last_turn_heard: str = ""          # what caller actually heard last turn
+        self.last_turn_generated: str = ""      # what LLM produced last turn
+        self.last_turn_interrupted: bool = False
+        self.last_unsaid: str = ""              # portion generated but not heard
+        self.goal: str = (
+            "Remind the subscriber about their upcoming renewal and help them "
+            "decide whether to renew."
+        )
+
         system_prompt = get_system_prompt(
             subscriber=subscriber,
             company_name=company_name,
@@ -56,8 +88,50 @@ class ConversationManager:
         )
         self.message_history.append({"role": "system", "content": system_prompt})
 
+    def _update_state(self, last_user_text: str, last_agent_text: str) -> None:
+        """Advance the state machine based on the most recent exchange."""
+        text = f"{last_user_text} {last_agent_text}".lower()
+        # Hard priority: closing wins over everything else.
+        if any(kw in last_user_text.lower() for kw in _STATE_KEYWORDS[ConversationState.CLOSING]):
+            self.state = ConversationState.CLOSING
+            return
+        for state, keywords in _STATE_KEYWORDS.items():
+            if state is ConversationState.CLOSING:
+                continue
+            if any(kw in text for kw in keywords):
+                self.state = state
+                return
+        # Default progression: GREETING → RENEWAL_PITCH after first exchange.
+        if self.state is ConversationState.GREETING and last_user_text:
+            self.state = ConversationState.RENEWAL_PITCH
+
+    def state_block(self) -> str:
+        """
+        Render a compact state block to inject into the system prompt each turn.
+        Gives the LLM explicit memory of where the call is and what was interrupted.
+        """
+        parts = [
+            f"Current state: {self.state.value}",
+            f"Goal: {self.goal}",
+        ]
+        if self.last_turn_interrupted and self.last_unsaid:
+            parts.append(
+                f"Your last reply was INTERRUPTED. You already said: "
+                f"{self.last_turn_heard!r}. You were cut off before saying: "
+                f"{self.last_unsaid!r}. Don't repeat what was already said; "
+                f"address the caller's interruption, then continue the flow "
+                f"only if still relevant."
+            )
+        elif self.last_turn_heard:
+            parts.append(f"Your last reply (fully delivered): {self.last_turn_heard!r}")
+        return "\n".join(f"- {p}" for p in parts)
+
     def build_messages(self, user_text: str) -> List[dict]:
-        """Append user turn to history and return full message list for LLM."""
+        """
+        Append user turn to history and return message list for LLM with a
+        fresh "Call State" block injected so the LLM always has current goal
+        and any interruption memory.
+        """
         self.transcript.append(
             {
                 "role": "user",
@@ -66,8 +140,17 @@ class ConversationManager:
             }
         )
         self.message_history.append({"role": "user", "content": user_text})
-        self.state = ConversationState.ACTIVE
-        return self.message_history
+
+        # Clone history with a state-augmented system prompt so the LLM always
+        # has fresh memory of where the call is — without mutating the stored
+        # history (which would bloat every subsequent call).
+        augmented = list(self.message_history)
+        base_system = augmented[0]["content"] if augmented else ""
+        augmented[0] = {
+            "role": "system",
+            "content": f"{base_system}\n\n## Call State (live)\n{self.state_block()}",
+        }
+        return augmented
 
     def record_agent_turn(self, text: str) -> None:
         """Record what the agent said for transcript and message history."""
@@ -79,6 +162,44 @@ class ConversationManager:
             }
         )
         self.message_history.append({"role": "assistant", "content": text})
+
+    def record_turn_result(
+        self,
+        user_text: str,
+        generated: str,
+        heard: str,
+    ) -> None:
+        """
+        Record a full turn outcome (both what the LLM produced and what
+        the caller actually heard). Updates barge-in memory + state machine.
+
+        Call this once per turn AFTER _speak returns.
+        """
+        generated = (generated or "").strip()
+        heard = (heard or "").strip()
+
+        self.last_turn_generated = generated
+        self.last_turn_heard = heard
+        self.last_turn_interrupted = bool(heard) and heard != generated
+        # The tail of `generated` not present in `heard`.
+        if self.last_turn_interrupted:
+            if generated.startswith(heard):
+                self.last_unsaid = generated[len(heard):].lstrip(" ,.;:—–-")
+            else:
+                # Word-boundary fallback if the prefix isn't exact.
+                heard_words = heard.split()
+                gen_words = generated.split()
+                if len(gen_words) > len(heard_words):
+                    self.last_unsaid = " ".join(gen_words[len(heard_words):])
+                else:
+                    self.last_unsaid = ""
+        else:
+            self.last_unsaid = ""
+
+        if heard:
+            self.record_agent_turn(heard)
+
+        self._update_state(user_text, heard)
 
     def accumulate_token(self, token: str) -> Optional[str]:
         """
