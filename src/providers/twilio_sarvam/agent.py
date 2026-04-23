@@ -258,36 +258,51 @@ class TwilioSarvamAgent(BaseVoiceAgent):
             except WebSocketDisconnect:
                 break
 
+    async def _trigger_barge_in(
+        self,
+        session: CallSession,
+        websocket: WebSocket,
+        reason: str,
+    ) -> None:
+        """
+        Interrupt any in-flight agent response.
+
+        Idempotent — safe to call multiple times in a row. If the agent
+        isn't currently speaking, this is a no-op aside from the log.
+        """
+        if session.pending_llm_task and not session.pending_llm_task.done():
+            session.pending_llm_task.cancel()
+        if session.conversation.is_agent_speaking:
+            logger.info(f"Barge-in [{reason}] — cancelling agent speech")
+            session.conversation.handle_barge_in()
+            session.tts.cancel()
+            await session.twilio_handler.send_clear(websocket)
+
     async def _process_stt_events(
         self, session: CallSession, websocket: WebSocket
     ) -> None:
         """
-        Process STT events with interim-transcript speculation.
+        Process STT events with two barge-in triggers:
 
-        Strategy:
-        - Track partial transcripts as they arrive.
-        - On speech_end / final transcript → start LLM immediately.
-        - If a partial sits for > PARTIAL_SPECULATION_DELAY seconds → speculate.
-        - New speech input cancels any pending LLM task (barge-in + restart).
+        1. **Sarvam VAD** (`speech_start` event) — ideal, fires as soon as
+           Sarvam detects voice activity.
+        2. **Transcript fallback** — if any transcript (partial or final)
+           arrives while the agent is speaking, treat it as barge-in.
+           This covers the case where Sarvam's WS endpoint doesn't emit
+           `speech_start` reliably — we at least interrupt when we see proof
+           the user spoke.
         """
         async for event in session.stt.receive_events():
             event_type = event.get("type", "")
 
-            # VAD: user started speaking → interrupt agent if speaking.
+            # (1) Primary barge-in trigger: Sarvam VAD.
             if event_type == "speech_start":
                 logger.info("STT: speech_start (user talking)")
-                if session.pending_llm_task and not session.pending_llm_task.done():
-                    session.pending_llm_task.cancel()
-                if session.conversation.is_agent_speaking:
-                    logger.info("Barge-in — cancelling agent speech")
-                    session.conversation.handle_barge_in()
-                    session.tts.cancel()
-                    await session.twilio_handler.send_clear(websocket)
+                await self._trigger_barge_in(session, websocket, "speech_start")
                 continue
 
-            # VAD: user stopped speaking → final transcript should follow.
             if event_type == "speech_end":
-                logger.debug("STT: speech_end")
+                logger.info("STT: speech_end")
                 continue
 
             # Transcript event: {"type":"data", "data":{"transcript":"...", ...}}
@@ -298,14 +313,17 @@ class TwilioSarvamAgent(BaseVoiceAgent):
                     continue
                 is_final = data.get("is_final", True)  # default: treat as final
 
+                # (2) Fallback barge-in: any transcript while agent is speaking
+                # means the user was talking during our reply — interrupt now.
+                if session.conversation.is_agent_speaking:
+                    await self._trigger_barge_in(session, websocket, "transcript")
+
                 if is_final:
                     logger.info(f"STT final transcript: {transcript!r}")
-                    if session.pending_llm_task and not session.pending_llm_task.done():
-                        session.pending_llm_task.cancel()
                     session.last_partial_text = ""
                     await self._run_turn(session, websocket, transcript, fast=False)
                 else:
-                    logger.debug(f"STT partial: {transcript!r}")
+                    logger.info(f"STT partial: {transcript!r}")
                     session.last_partial_text = transcript
                     session.last_partial_time = time.monotonic()
 
@@ -320,33 +338,49 @@ class TwilioSarvamAgent(BaseVoiceAgent):
         messages = session.conversation.build_messages(user_text)
         logger.info(f"LLM turn starting (fast={fast}, user={user_text!r})")
 
-        full_response = ""
+        # What the LLM *generated* (debug only) vs. what the caller actually *heard*.
+        generated_full = ""
+        heard_chunks: list[str] = []
+
         session.conversation.is_agent_speaking = True
 
         try:
             async for token in session.llm.chat_completion_stream(
                 messages=messages,
-                temperature=0.5,   # lower temp = less rambling
-                max_tokens=60,     # hard cap to enforce short replies
+                temperature=0.5,
+                max_tokens=60,
                 fast=fast,
             ):
                 if not session.conversation.is_agent_speaking:
                     break
                 chunk = session.conversation.accumulate_token(token)
-                full_response += token
+                generated_full += token
                 if chunk:
-                    await self._speak(session, websocket, chunk)
+                    _, heard = await self._speak(session, websocket, chunk)
+                    if heard:
+                        heard_chunks.append(heard)
 
             remaining = session.conversation.flush_accumulated()
             if remaining and session.conversation.is_agent_speaking:
-                await self._speak(session, websocket, remaining)
+                _, heard = await self._speak(session, websocket, remaining)
+                if heard:
+                    heard_chunks.append(heard)
 
-            logger.info(f"LLM turn complete: {full_response!r}")
+            # Record only what actually reached the caller (full chunks plus
+            # any word-aligned prefix of an interrupted chunk).
+            heard_response = " ".join(heard_chunks).strip()
+            logger.info(
+                f"LLM turn complete: generated={generated_full!r}, "
+                f"heard={heard_response!r}"
+            )
 
-            if full_response:
-                session.conversation.record_agent_turn(full_response)
+            if heard_response:
+                session.conversation.record_agent_turn(heard_response)
         except asyncio.CancelledError:
             logger.debug("Turn cancelled (likely barge-in)")
+            heard_response = " ".join(heard_chunks).strip()
+            if heard_response:
+                session.conversation.record_agent_turn(heard_response)
             raise
         finally:
             session.conversation.is_agent_speaking = False
@@ -400,50 +434,76 @@ class TwilioSarvamAgent(BaseVoiceAgent):
             {"role": "user", "content": greeting_prompt}
         )
 
-        full_response = ""
+        generated_full = ""
+        heard_chunks: list[str] = []
         collected_audio = bytearray()
         total_audio_sent = 0
+        any_interrupt = False
         session.conversation.is_agent_speaking = True
+
+        async def _speak_greeting_chunk(chunk_text: str) -> tuple[bool, str]:
+            """
+            Stream one chunk; returns (spoke_fully, heard_text).
+            heard_text is the chunk (if fully delivered) or a word-aligned prefix
+            estimated from bytes streamed to Twilio (if interrupted).
+            """
+            nonlocal total_audio_sent
+            interrupted = False
+            bytes_sent_this_chunk = 0
+            async for audio in session.tts.synthesize(chunk_text):
+                collected_audio.extend(audio)
+                if not session.conversation.is_agent_speaking:
+                    interrupted = True
+                    break
+                await session.twilio_handler.send_audio(websocket, audio)
+                total_audio_sent += len(audio)
+                bytes_sent_this_chunk += len(audio)
+            if interrupted:
+                return False, self._estimate_heard_text(chunk_text, bytes_sent_this_chunk)
+            return True, chunk_text
 
         try:
             async for token in session.llm.chat_completion_stream(
                 messages=session.conversation.message_history,
                 temperature=0.5,
-                max_tokens=50,   # greeting is one short sentence
+                max_tokens=50,
                 fast=True,
             ):
                 if not session.conversation.is_agent_speaking:
                     logger.info("Greeting interrupted mid-generation")
+                    any_interrupt = True
                     break
                 chunk = session.conversation.accumulate_token(token)
-                full_response += token
+                generated_full += token
                 if chunk:
                     logger.info(f"Greeting chunk to TTS: {chunk!r}")
-                    async for audio in session.tts.synthesize(chunk):
-                        collected_audio.extend(audio)
-                        if session.conversation.is_agent_speaking:
-                            await session.twilio_handler.send_audio(websocket, audio)
-                            total_audio_sent += len(audio)
+                    spoke_fully, heard = await _speak_greeting_chunk(chunk)
+                    if not spoke_fully:
+                        any_interrupt = True
+                    if heard:
+                        heard_chunks.append(heard)
 
             remaining = session.conversation.flush_accumulated()
             if remaining and session.conversation.is_agent_speaking:
                 logger.info(f"Greeting final chunk to TTS: {remaining!r}")
-                async for audio in session.tts.synthesize(remaining):
-                    collected_audio.extend(audio)
-                    await session.twilio_handler.send_audio(websocket, audio)
-                    total_audio_sent += len(audio)
+                spoke_fully, heard = await _speak_greeting_chunk(remaining)
+                if not spoke_fully:
+                    any_interrupt = True
+                if heard:
+                    heard_chunks.append(heard)
 
+            heard_response = " ".join(heard_chunks).strip()
             logger.info(
-                f"Greeting done: text={full_response!r}, audio_sent={total_audio_sent}B"
+                f"Greeting done: heard={heard_response!r}, "
+                f"generated={generated_full!r}, audio_sent={total_audio_sent}B"
             )
 
-            if full_response:
-                # Replace the fake greeting-prompt with the actual response in history.
+            if heard_response:
                 session.conversation.message_history.pop(-1)
-                session.conversation.record_agent_turn(full_response)
+                session.conversation.record_agent_turn(heard_response)
 
-                # Cache for next call with same language/voice/company/agent.
-                if collected_audio:
+                # Only cache fully-heard greetings (not interrupted ones).
+                if collected_audio and not any_interrupt:
                     await self.greeting_cache.set(
                         session.subscriber.language,
                         session.tts.voice,
@@ -456,26 +516,71 @@ class TwilioSarvamAgent(BaseVoiceAgent):
                         session.tts.voice,
                         self.config.company_name,
                         self.config.agent_name,
-                        full_response,
+                        heard_response,
                     )
         finally:
             session.conversation.is_agent_speaking = False
 
+    # Twilio plays mulaw at 8000 bytes/sec; natural speech is ~2.5 words/sec.
+    _TWILIO_BYTES_PER_SEC = 8000
+    _WORDS_PER_SEC = 2.5
+    # Twilio holds a small buffer. When we send `clear`, anything queued but
+    # not yet played is discarded — subtract ~80ms to stay slightly conservative.
+    _TWILIO_PLAYBACK_BUFFER_SEC = 0.08
+
+    def _estimate_heard_text(self, text: str, bytes_sent: int) -> str:
+        """
+        Estimate which portion of `text` the caller actually heard based on
+        how many mulaw bytes reached Twilio before we sent `clear`.
+
+        Uses a word-boundary truncation so the stored agent turn remains
+        grammatically coherent instead of cutting off mid-word.
+        """
+        words = text.split()
+        if not words:
+            return ""
+        seconds_played = max(
+            0.0, (bytes_sent / self._TWILIO_BYTES_PER_SEC) - self._TWILIO_PLAYBACK_BUFFER_SEC
+        )
+        words_heard = int(seconds_played * self._WORDS_PER_SEC)
+        # At least report 0 words rather than inventing ones.
+        words_heard = max(0, min(words_heard, len(words)))
+        return " ".join(words[:words_heard])
+
     async def _speak(
         self, session: CallSession, websocket: WebSocket, text: str
-    ) -> None:
-        """Send text to TTS and stream audio back to Twilio."""
+    ) -> tuple[bool, str]:
+        """
+        Send text to TTS and stream audio back to Twilio.
+
+        Returns:
+            (spoke_fully, heard_text)
+              spoke_fully — True if the entire chunk reached Twilio.
+              heard_text  — full `text` if not interrupted, else a
+                            word-aligned prefix estimated from bytes streamed.
+        """
         mark_id = str(uuid.uuid4())[:8]
         sent = 0
+        interrupted = False
 
         async for audio_chunk in session.tts.synthesize(text):
             if not session.conversation.is_agent_speaking:
+                interrupted = True
                 break
             await session.twilio_handler.send_audio(websocket, audio_chunk)
             sent += len(audio_chunk)
 
-        logger.debug(f"Spoke: {text!r} ({sent}B)")
+        if interrupted:
+            heard = self._estimate_heard_text(text, sent)
+            logger.debug(
+                f"Spoke (interrupted): {text!r} -> heard {heard!r} ({sent}B)"
+            )
+        else:
+            heard = text
+            logger.debug(f"Spoke: {text!r} ({sent}B)")
+
         await session.twilio_handler.send_mark(websocket, mark_id)
+        return (not interrupted), heard
 
     async def _cleanup_session(self, session: CallSession, call_id: str) -> None:
         """Close all connections and clean up session state."""
