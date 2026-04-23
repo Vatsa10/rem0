@@ -37,10 +37,34 @@ class SarvamTTSClient:
     def is_open(self) -> bool:
         return self._is_open and self.ws is not None
 
-    async def connect(self) -> None:
-        """Open WebSocket connection and send initial config."""
+    async def connect(self, open_timeout: float = 5.0, retries: int = 2) -> None:
+        """
+        Open WebSocket connection with bounded timeout and retry.
+
+        Raises TimeoutError / websockets.WebSocketException after all retries fail,
+        so callers can react (skip greeting / end call / mark invalid).
+        """
         headers = {"api-subscription-key": self.api_key}
-        self.ws = await websockets.connect(self.WS_URL, additional_headers=headers)
+        last_error: Optional[Exception] = None
+        for attempt in range(1, retries + 2):  # retries=2 → 3 attempts total
+            try:
+                self.ws = await websockets.connect(
+                    self.WS_URL,
+                    additional_headers=headers,
+                    open_timeout=open_timeout,
+                )
+                break
+            except Exception as e:
+                last_error = e
+                logger.warning(
+                    f"Sarvam TTS connect attempt {attempt} failed: {e!r}"
+                )
+                if attempt < retries + 1:
+                    await asyncio.sleep(0.3 * attempt)  # small backoff
+        else:
+            # for/else runs only if loop completed without break
+            raise last_error or TimeoutError("TTS connect failed")
+
         self._is_open = True
 
         # Sarvam TTS WS config — the WS endpoint uses bulbul:v2 by default
