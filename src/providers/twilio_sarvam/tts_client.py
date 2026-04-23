@@ -38,7 +38,14 @@ class SarvamTTSClient:
         self._is_open = False
         self._audio_queue: asyncio.Queue[Optional[bytes]] = asyncio.Queue()
         self._cancelled = False
+        # When False, _receive_loop drops incoming audio chunks on the floor
+        # instead of queuing them. Flipped False on cancel() (so stale chunks
+        # from a cancelled text don't leak into the next synthesize) and
+        # flipped back True at the start of the next synthesize() after a
+        # brief drain window.
+        self._accepting_audio = True
         self._ping_task: Optional[asyncio.Task] = None
+        self._receive_loop_task: Optional[asyncio.Task] = None
 
     @property
     def is_open(self) -> bool:
@@ -108,7 +115,7 @@ class SarvamTTSClient:
             f"Sarvam TTS connected: lang={self.language}, voice={self.voice}, "
             f"model={self.model}, codec=mulaw@8kHz"
         )
-        asyncio.create_task(self._receive_loop())
+        self._receive_loop_task = asyncio.create_task(self._receive_loop())
         self._ping_task = asyncio.create_task(self._ping_loop())
 
     async def _ping_loop(self) -> None:
@@ -241,13 +248,21 @@ class SarvamTTSClient:
         )
 
     def cancel(self) -> None:
-        """Cancel current TTS generation (for barge-in)."""
+        """
+        Cancel current TTS generation (for barge-in).
+
+        Signal-only — sets the _cancelled flag and wakes any synthesize()
+        loop currently iterating the queue. We intentionally do NOT drain
+        the queue here because synthesize() may be mid-await on get(); a
+        concurrent drain corrupts that iteration. synthesize() checks the
+        _cancelled flag between chunks and exits cleanly.
+        """
         self._cancelled = True
-        while not self._audio_queue.empty():
-            try:
-                self._audio_queue.get_nowait()
-            except asyncio.QueueEmpty:
-                break
+        # Wake the synthesize() loop if it's waiting on an empty queue.
+        try:
+            self._audio_queue.put_nowait(None)
+        except asyncio.QueueFull:
+            pass
 
     async def close(self) -> None:
         """Close the TTS WebSocket connection."""
@@ -260,3 +275,11 @@ class SarvamTTSClient:
             except Exception as e:
                 logger.debug(f"TTS close: {e}")
             logger.info("Sarvam TTS disconnected")
+        # Wait for the receive loop to exit so we don't leak the task.
+        if self._receive_loop_task and not self._receive_loop_task.done():
+            try:
+                await asyncio.wait_for(self._receive_loop_task, timeout=1.0)
+            except asyncio.TimeoutError:
+                self._receive_loop_task.cancel()
+            except Exception:
+                pass

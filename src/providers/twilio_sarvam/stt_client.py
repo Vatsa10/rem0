@@ -2,6 +2,7 @@ import asyncio
 import base64
 import json
 import logging
+import time
 from typing import AsyncGenerator, Optional
 
 import websockets
@@ -62,7 +63,16 @@ class SarvamSTTClient:
         # Twilio sends 20ms frames; sending each one individually as a WAV
         # file is both wasteful and too short for accurate recognition.
         self._buffer_target_bytes = int(sample_rate * 2 * 0.2)
+        # Hard cap: if buffer grows beyond 4s (silence never broke the size
+        # threshold for whatever reason), force a flush anyway.
+        self._buffer_max_bytes = int(sample_rate * 2 * 4.0)
         self._audio_buffer = bytearray()
+        # Timeout-based flush: if we've held audio for > 300ms without the
+        # size threshold triggering a flush (user paused mid-sentence), push
+        # it to Sarvam so VAD can still fire speech_end.
+        self._last_flush_time = 0.0
+        self._flush_timeout_sec = 0.3
+        self._receive_loop_task: Optional[asyncio.Task] = None
 
     @property
     def is_open(self) -> bool:
@@ -103,7 +113,7 @@ class SarvamSTTClient:
             f"Sarvam STT connected: lang={self.language}, model={self.model}, "
             f"sr={self.sample_rate}Hz, vad=on"
         )
-        asyncio.create_task(self._receive_loop())
+        self._receive_loop_task = asyncio.create_task(self._receive_loop())
         # No ping loop for STT — Sarvam STT doesn't support ping messages,
         # and the constant Twilio audio stream keeps the connection alive.
 
@@ -149,15 +159,29 @@ class SarvamSTTClient:
 
     async def send_audio(self, pcm_audio: bytes) -> None:
         """
-        Append PCM s16le mono audio to the buffer. Flush to Sarvam STT
-        once we have ~200ms of audio — Sarvam can't transcribe 20ms chunks well.
+        Append PCM s16le mono audio to the buffer. Flush to Sarvam STT:
+          - once buffer reaches ~200ms of audio (normal case), OR
+          - if we've held audio for > 300ms without flushing (user paused), OR
+          - if buffer grows beyond the hard cap (safety net).
         """
         if not self.is_open or not pcm_audio:
             return
 
         self._audio_buffer.extend(pcm_audio)
-        if len(self._audio_buffer) >= self._buffer_target_bytes:
+        now = time.monotonic()
+        if not self._last_flush_time:
+            self._last_flush_time = now
+
+        size_trigger = len(self._audio_buffer) >= self._buffer_target_bytes
+        time_trigger = (
+            self._audio_buffer
+            and (now - self._last_flush_time) >= self._flush_timeout_sec
+        )
+        overflow_trigger = len(self._audio_buffer) >= self._buffer_max_bytes
+
+        if size_trigger or time_trigger or overflow_trigger:
             await self._flush_buffer()
+            self._last_flush_time = now
 
     async def _flush_buffer(self) -> None:
         """Wrap the buffered PCM in a WAV container and send to Sarvam."""
@@ -206,3 +230,12 @@ class SarvamSTTClient:
             except Exception as e:
                 logger.debug(f"STT close: {e}")
             logger.info("Sarvam STT disconnected")
+
+        # Wait for the receive loop to exit so we don't leak the task.
+        if self._receive_loop_task and not self._receive_loop_task.done():
+            try:
+                await asyncio.wait_for(self._receive_loop_task, timeout=1.0)
+            except asyncio.TimeoutError:
+                self._receive_loop_task.cancel()
+            except Exception:
+                pass

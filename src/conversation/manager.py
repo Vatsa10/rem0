@@ -1,4 +1,5 @@
 import logging
+import re
 from datetime import datetime
 from enum import Enum
 from typing import List, Optional
@@ -88,17 +89,41 @@ class ConversationManager:
         )
         self.message_history.append({"role": "system", "content": system_prompt})
 
+    @staticmethod
+    def _contains_any_word(text: str, keywords: list) -> bool:
+        """
+        Word-boundary keyword match. Prevents 'bye' in 'goodbye' or 'maybe'
+        from triggering the CLOSING state. Multi-word keywords ('not interested')
+        are matched as a phrase.
+        """
+        if not text:
+            return False
+        lowered = text.lower()
+        for kw in keywords:
+            if " " in kw:
+                # Multi-word phrase — substring match is fine
+                if kw in lowered:
+                    return True
+            else:
+                # Single word — require word boundaries on both sides
+                if re.search(rf"\b{re.escape(kw)}\b", lowered):
+                    return True
+        return False
+
     def _update_state(self, last_user_text: str, last_agent_text: str) -> None:
         """Advance the state machine based on the most recent exchange."""
-        text = f"{last_user_text} {last_agent_text}".lower()
-        # Hard priority: closing wins over everything else.
-        if any(kw in last_user_text.lower() for kw in _STATE_KEYWORDS[ConversationState.CLOSING]):
+        combined = f"{last_user_text} {last_agent_text}"
+        # Hard priority: closing wins — but only on a word-boundary match
+        # ('bye' must be a standalone word, not buried in 'maybe' etc).
+        if self._contains_any_word(
+            last_user_text, _STATE_KEYWORDS[ConversationState.CLOSING]
+        ):
             self.state = ConversationState.CLOSING
             return
         for state, keywords in _STATE_KEYWORDS.items():
             if state is ConversationState.CLOSING:
                 continue
-            if any(kw in text for kw in keywords):
+            if self._contains_any_word(combined, keywords):
                 self.state = state
                 return
         # Default progression: GREETING → RENEWAL_PITCH after first exchange.

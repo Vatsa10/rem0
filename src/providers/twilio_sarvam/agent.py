@@ -37,11 +37,19 @@ class CallSession:
     tts: SarvamTTSClient
     llm: LLMClient
     twilio_handler: TwilioMediaStreamHandler
+    # Time period captured once at session creation so cache GET (pre-warm)
+    # and cache SET (post-gen) can't end up on different keys if the clock
+    # rolls between morning→afternoon mid-call.
+    time_period: str = "afternoon"
     cached_greeting: Optional[bytes] = None
     cached_greeting_text: Optional[str] = None
     transcript: str = ""
+    # "in_progress" | "completed" | "prewarm_failed"
     status: str = "in_progress"
     pending_llm_task: Optional[asyncio.Task] = field(default=None)
+    # asyncio.Lock can't have a default_factory in dataclass-with-defaults easily;
+    # we'll lazily init it in the agent if None.
+    _pending_task_lock: Optional[asyncio.Lock] = field(default=None)
     last_partial_text: str = ""
     last_partial_time: float = 0.0
 
@@ -146,6 +154,8 @@ class TwilioSarvamAgent(BaseVoiceAgent):
             tts=tts,
             llm=llm,
             twilio_handler=twilio_handler,
+            time_period=self._time_period(),  # fix cache-key drift
+            _pending_task_lock=asyncio.Lock(),
         )
         self.active_calls[call_id] = session
 
@@ -171,7 +181,7 @@ class TwilioSarvamAgent(BaseVoiceAgent):
         """
         lang = session.subscriber.language
         voice = session.tts.voice
-        period = self._time_period()
+        period = session.time_period  # memoized at session creation
         try:
             await self.greeting_cache.connect()
 
@@ -199,6 +209,11 @@ class TwilioSarvamAgent(BaseVoiceAgent):
                     f"Pre-warm TTS connect failed for call_sid={session.call_sid}: "
                     f"{tts_result!r}"
                 )
+            # If both pipes failed we can't run a call — mark session so
+            # handle_media_stream fails fast instead of limping into a
+            # broken call.
+            if isinstance(stt_result, Exception) and isinstance(tts_result, Exception):
+                session.status = "prewarm_failed"
 
             if isinstance(greeting, bytes):
                 session.cached_greeting = greeting
@@ -230,6 +245,12 @@ class TwilioSarvamAgent(BaseVoiceAgent):
         session = self.active_calls.get(call_id)
         if not session:
             logger.error(f"No session found for call_id={call_id}")
+            await websocket.close()
+            return
+        if session.status == "prewarm_failed":
+            logger.error(
+                f"Session {call_id} failed pre-warm (STT+TTS both down); closing"
+            )
             await websocket.close()
             return
 
@@ -311,20 +332,33 @@ class TwilioSarvamAgent(BaseVoiceAgent):
         agent is mid-utterance, stops the TTS stream and flushes Twilio's
         audio buffer so the caller hears the interruption take effect.
 
+        Serialized via session._pending_task_lock so rapid-fire triggers
+        (speech_start + transcript arriving in the same tick) can't race
+        on pending_llm_task assignment/cancellation.
+
         Idempotent — safe to call multiple times.
         """
-        cancelled_turn = False
-        if session.pending_llm_task and not session.pending_llm_task.done():
-            session.pending_llm_task.cancel()
-            cancelled_turn = True
+        lock = session._pending_task_lock
+        # Fallback if someone created a session without a lock (shouldn't happen).
+        if lock is None:
+            lock = asyncio.Lock()
+            session._pending_task_lock = lock
 
-        if session.conversation.is_agent_speaking:
-            logger.info(f"Barge-in [{reason}] — cancelling agent speech")
-            session.conversation.handle_barge_in()
-            session.tts.cancel()
-            await session.twilio_handler.send_clear(websocket)
-        elif cancelled_turn:
-            logger.info(f"Barge-in [{reason}] — cancelled pending LLM turn (pre-speak)")
+        async with lock:
+            cancelled_turn = False
+            if session.pending_llm_task and not session.pending_llm_task.done():
+                session.pending_llm_task.cancel()
+                cancelled_turn = True
+
+            if session.conversation.is_agent_speaking:
+                logger.info(f"Barge-in [{reason}] — cancelling agent speech")
+                session.conversation.handle_barge_in()
+                session.tts.cancel()
+                await session.twilio_handler.send_clear(websocket)
+            elif cancelled_turn:
+                logger.info(
+                    f"Barge-in [{reason}] — cancelled pending LLM turn (pre-speak)"
+                )
 
     async def _process_stt_events(
         self, session: CallSession, websocket: WebSocket
@@ -389,12 +423,16 @@ class TwilioSarvamAgent(BaseVoiceAgent):
                     #
                     # Direct create_task (no _safe_task wrapper) avoids the
                     # "coroutine was never awaited" warning when a task is
-                    # cancelled in the same tick it's created.
-                    turn_task = asyncio.create_task(
-                        self._run_turn(session, websocket, transcript)
-                    )
-                    turn_task.add_done_callback(self._log_task_exception)
-                    session.pending_llm_task = turn_task
+                    # cancelled in the same tick it's created. Assignment is
+                    # guarded by the same lock barge-in uses.
+                    lock = session._pending_task_lock or asyncio.Lock()
+                    session._pending_task_lock = lock
+                    async with lock:
+                        turn_task = asyncio.create_task(
+                            self._run_turn(session, websocket, transcript)
+                        )
+                        turn_task.add_done_callback(self._log_task_exception)
+                        session.pending_llm_task = turn_task
                 else:
                     logger.info(f"STT partial: {transcript!r}")
                     session.last_partial_text = transcript
@@ -427,6 +465,7 @@ class TwilioSarvamAgent(BaseVoiceAgent):
 
         # Phase 1 — collect full LLM response (no audio yet).
         full_response = ""
+        llm_failed = False
         try:
             async for token in session.llm.chat_completion_stream(
                 messages=messages,
@@ -438,8 +477,21 @@ class TwilioSarvamAgent(BaseVoiceAgent):
         except asyncio.CancelledError:
             logger.debug("LLM generation cancelled before speak phase")
             raise
+        except Exception as e:
+            # LLM provider error (rate-limit, 5xx, network hiccup). Don't
+            # speak a half-generated reply — fall back to a short recovery
+            # line so the caller hears *something* and the call doesn't
+            # stall in dead air.
+            logger.error(
+                f"LLM generation failed (partial={len(full_response)} chars): {e!r}"
+            )
+            llm_failed = True
 
-        reply = full_response.strip()
+        if llm_failed:
+            reply = "Sorry, I had a brief hiccup — could you repeat that?"
+        else:
+            reply = full_response.strip()
+
         logger.info(f"LLM turn generated: {reply!r}")
 
         if not reply:
@@ -493,19 +545,44 @@ class TwilioSarvamAgent(BaseVoiceAgent):
             )
             session.conversation.is_agent_speaking = True
             chunk_size = 640  # 80ms of mulaw @ 8kHz
+            total_audio_bytes = len(session.cached_greeting)
+            bytes_sent = 0
+            interrupted = False
             try:
-                for i in range(0, len(session.cached_greeting), chunk_size):
+                for i in range(0, total_audio_bytes, chunk_size):
                     if not session.conversation.is_agent_speaking:
+                        interrupted = True
+                        # Explicitly flush Twilio buffer in case barge-in
+                        # fired between two chunks without _trigger_barge_in
+                        # seeing is_agent_speaking == True anymore.
+                        try:
+                            await session.twilio_handler.send_clear(websocket)
+                        except Exception:
+                            pass
                         break
                     chunk = session.cached_greeting[i : i + chunk_size]
-                    await session.twilio_handler.send_audio(websocket, chunk)
+                    try:
+                        await session.twilio_handler.send_audio(websocket, chunk)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as e:
+                        logger.warning(f"Greeting send_audio failed: {e}")
+                        break
+                    bytes_sent += len(chunk)
                     await asyncio.sleep(0.08)  # pace to real-time playback
 
                 if session.cached_greeting_text:
+                    # On interrupt, record only the portion the caller heard.
+                    if interrupted:
+                        heard = self._estimate_heard_text(
+                            session.cached_greeting_text, bytes_sent
+                        )
+                    else:
+                        heard = session.cached_greeting_text
                     session.conversation.record_turn_result(
                         user_text="",
                         generated=session.cached_greeting_text,
-                        heard=session.cached_greeting_text,
+                        heard=heard,
                     )
             finally:
                 session.conversation.is_agent_speaking = False
@@ -513,7 +590,7 @@ class TwilioSarvamAgent(BaseVoiceAgent):
 
         # Slow path: full-response-then-speak.
         logger.info(f"Generating live greeting for {session.subscriber.name}")
-        period = self._time_period()
+        period = session.time_period  # memoized at session creation
         # 'late' (midnight–5 AM) is unusual — skip the time-of-day phrase then.
         time_greeting = f"good {period}" if period != "late" else "hello"
         greeting_prompt = (
@@ -677,7 +754,12 @@ class TwilioSarvamAgent(BaseVoiceAgent):
         return (not interrupted), heard
 
     async def _cleanup_session(self, session: CallSession, call_id: str) -> None:
-        """Close all connections and clean up session state."""
+        """
+        Close all connections and mark session as completed.
+        The session itself stays in active_calls until release_session() is
+        called — usually right after post-call analysis finishes. This
+        prevents a memory leak on repeated calls.
+        """
         if session.pending_llm_task and not session.pending_llm_task.done():
             session.pending_llm_task.cancel()
         await session.stt.close()
@@ -685,6 +767,35 @@ class TwilioSarvamAgent(BaseVoiceAgent):
         session.transcript = session.conversation.get_transcript_text()
         session.status = "completed"
         logger.info(f"Session cleaned up: call_id={call_id}")
+
+    def release_session(self, call_id: str) -> None:
+        """
+        Remove a completed session from the in-memory dict.
+        Call this after post-call analysis + DB update so the session can
+        be garbage collected. Safe to call on unknown ids.
+        """
+        if self.active_calls.pop(call_id, None) is not None:
+            logger.info(f"Session released from memory: call_id={call_id}")
+
+    async def shutdown(self) -> None:
+        """
+        App-level teardown: close the shared LLM HTTP pool and any sessions
+        still in memory. Called from the FastAPI shutdown event.
+        """
+        for cid in list(self.active_calls.keys()):
+            session = self.active_calls.get(cid)
+            if session:
+                try:
+                    await self._cleanup_session(session, cid)
+                except Exception as e:
+                    logger.warning(f"Shutdown: cleanup {cid} failed: {e}")
+                self.active_calls.pop(cid, None)
+        if self._shared_llm:
+            try:
+                await self._shared_llm.close()
+            except Exception as e:
+                logger.warning(f"Shutdown: LLM client close failed: {e}")
+            self._shared_llm = None
 
     async def end_call(self, call_id: str) -> None:
         """Programmatically end an active call via Twilio API."""

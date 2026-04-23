@@ -65,11 +65,13 @@ async def startup():
 
 @app.on_event("shutdown")
 async def shutdown():
+    # Delegate full agent teardown (active sessions + shared LLM client)
+    # to the agent's own shutdown() — see TwilioSarvamAgent.shutdown().
     if _automation is not None:
         try:
-            await _automation.agent._get_shared_llm().close()
-        except Exception:
-            pass
+            await _automation.agent.shutdown()
+        except Exception as e:
+            logger.warning(f"Agent shutdown failed: {e}")
     try:
         await get_greeting_cache().close()
     except Exception:
@@ -194,6 +196,10 @@ async def media_stream(websocket: WebSocket, call_id: str):
             logger.info(f"Post-call analysis saved: call_id={call_id}")
     except Exception as e:
         logger.error(f"Post-call analysis failed: {e}")
+    finally:
+        # Free the in-memory session whether analysis succeeded or not;
+        # without this, active_calls grows unbounded.
+        automation.agent.release_session(call_id)
 
 
 @app.get("/subscriptions/due")
