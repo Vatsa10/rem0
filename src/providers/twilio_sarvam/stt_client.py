@@ -124,7 +124,9 @@ class SarvamSTTClient:
                 if event_type == "error":
                     logger.error(f"STT ERROR from Sarvam: {event}")
                 else:
-                    logger.debug(f"STT event: {event_type} -> {str(event)[:200]}")
+                    # INFO level so we can see exactly which VAD/transcript
+                    # events Sarvam is actually emitting for a given call.
+                    logger.info(f"STT raw event: {event_type} -> {str(event)[:200]}")
                 await self._event_queue.put(event)
         except websockets.ConnectionClosed as e:
             logger.info(f"Sarvam STT connection closed: code={e.code}, reason={e.reason}")

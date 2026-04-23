@@ -283,36 +283,51 @@ class TwilioSarvamAgent(BaseVoiceAgent):
             except WebSocketDisconnect:
                 break
 
+    async def _trigger_barge_in(
+        self,
+        session: CallSession,
+        websocket: WebSocket,
+        reason: str,
+    ) -> None:
+        """
+        Interrupt any in-flight agent response.
+
+        Idempotent — safe to call multiple times in a row. If the agent
+        isn't currently speaking, this is a no-op aside from the log.
+        """
+        if session.pending_llm_task and not session.pending_llm_task.done():
+            session.pending_llm_task.cancel()
+        if session.conversation.is_agent_speaking:
+            logger.info(f"Barge-in [{reason}] — cancelling agent speech")
+            session.conversation.handle_barge_in()
+            session.tts.cancel()
+            await session.twilio_handler.send_clear(websocket)
+
     async def _process_stt_events(
         self, session: CallSession, websocket: WebSocket
     ) -> None:
         """
-        Process STT events with interim-transcript speculation.
+        Process STT events with two barge-in triggers:
 
-        Strategy:
-        - Track partial transcripts as they arrive.
-        - On speech_end / final transcript → start LLM immediately.
-        - If a partial sits for > PARTIAL_SPECULATION_DELAY seconds → speculate.
-        - New speech input cancels any pending LLM task (barge-in + restart).
+        1. **Sarvam VAD** (`speech_start` event) — ideal, fires as soon as
+           Sarvam detects voice activity.
+        2. **Transcript fallback** — if any transcript (partial or final)
+           arrives while the agent is speaking, treat it as barge-in.
+           This covers the case where Sarvam's WS endpoint doesn't emit
+           `speech_start` reliably — we at least interrupt when we see proof
+           the user spoke.
         """
         async for event in session.stt.receive_events():
             event_type = event.get("type", "")
 
-            # VAD: user started speaking → interrupt agent if speaking.
+            # (1) Primary barge-in trigger: Sarvam VAD.
             if event_type == "speech_start":
                 logger.info("STT: speech_start (user talking)")
-                if session.pending_llm_task and not session.pending_llm_task.done():
-                    session.pending_llm_task.cancel()
-                if session.conversation.is_agent_speaking:
-                    logger.info("Barge-in — cancelling agent speech")
-                    session.conversation.handle_barge_in()
-                    session.tts.cancel()
-                    await session.twilio_handler.send_clear(websocket)
+                await self._trigger_barge_in(session, websocket, "speech_start")
                 continue
 
-            # VAD: user stopped speaking → final transcript should follow.
             if event_type == "speech_end":
-                logger.debug("STT: speech_end")
+                logger.info("STT: speech_end")
                 continue
 
             # Transcript event: {"type":"data", "data":{"transcript":"...", ...}}
@@ -323,14 +338,17 @@ class TwilioSarvamAgent(BaseVoiceAgent):
                     continue
                 is_final = data.get("is_final", True)  # default: treat as final
 
+                # (2) Fallback barge-in: any transcript while agent is speaking
+                # means the user was talking during our reply — interrupt now.
+                if session.conversation.is_agent_speaking:
+                    await self._trigger_barge_in(session, websocket, "transcript")
+
                 if is_final:
                     logger.info(f"STT final transcript: {transcript!r}")
-                    if session.pending_llm_task and not session.pending_llm_task.done():
-                        session.pending_llm_task.cancel()
                     session.last_partial_text = ""
                     await self._run_turn(session, websocket, transcript, fast=False)
                 else:
-                    logger.debug(f"STT partial: {transcript!r}")
+                    logger.info(f"STT partial: {transcript!r}")
                     session.last_partial_text = transcript
                     session.last_partial_time = time.monotonic()
 
