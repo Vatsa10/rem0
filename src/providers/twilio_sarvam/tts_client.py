@@ -157,12 +157,17 @@ class SarvamTTSClient:
 
                 if event_type == "audio":
                     b64 = event.get("data", {}).get("audio", "")
-                    if b64:
-                        try:
-                            audio_bytes = base64.b64decode(b64)
-                            await self._audio_queue.put(audio_bytes)
-                        except Exception as e:
-                            logger.error(f"TTS: failed to decode audio: {e}")
+                    if not b64:
+                        continue
+                    # Drop stale chunks from a cancelled synthesis — they'd
+                    # otherwise overlap with the next utterance's audio.
+                    if not self._accepting_audio:
+                        continue
+                    try:
+                        audio_bytes = base64.b64decode(b64)
+                        await self._audio_queue.put(audio_bytes)
+                    except Exception as e:
+                        logger.error(f"TTS: failed to decode audio: {e}")
 
                 elif event_type == "events":
                     inner_type = event.get("data", {}).get("event_type")
@@ -208,7 +213,22 @@ class SarvamTTSClient:
             logger.warning("TTS synthesize: not open, skipping")
             return
 
+        # If a previous synth was cancelled, let any in-flight stale audio
+        # chunks land in _receive_loop and be dropped (because
+        # _accepting_audio is still False). 100ms covers typical network
+        # jitter for the tail end of a cancelled Sarvam response.
+        if self._cancelled:
+            await asyncio.sleep(0.10)
+
+        # Final drain — catch anything that snuck in between the cancel
+        # drain and now — then re-open the intake for this new synthesis.
+        try:
+            while True:
+                self._audio_queue.get_nowait()
+        except asyncio.QueueEmpty:
+            pass
         self._cancelled = False
+        self._accepting_audio = True
 
         try:
             await self.ws.send(json.dumps({"type": "text", "data": {"text": clean}}))
@@ -251,14 +271,22 @@ class SarvamTTSClient:
         """
         Cancel current TTS generation (for barge-in).
 
-        Signal-only — sets the _cancelled flag and wakes any synthesize()
-        loop currently iterating the queue. We intentionally do NOT drain
-        the queue here because synthesize() may be mid-await on get(); a
-        concurrent drain corrupts that iteration. synthesize() checks the
-        _cancelled flag between chunks and exits cleanly.
+        Three things:
+        1. _cancelled=True — synthesize()'s loop breaks on the next iteration.
+        2. _accepting_audio=False — _receive_loop drops any chunks Sarvam
+           keeps sending for the cancelled text (those would otherwise
+           overlap with the next utterance's audio in the caller's ear).
+        3. Put None on the queue — wakes synthesize() if it's blocked on
+           queue.get().
         """
         self._cancelled = True
-        # Wake the synthesize() loop if it's waiting on an empty queue.
+        self._accepting_audio = False
+        # Drain anything already queued from the cancelled synth.
+        try:
+            while True:
+                self._audio_queue.get_nowait()
+        except asyncio.QueueEmpty:
+            pass
         try:
             self._audio_queue.put_nowait(None)
         except asyncio.QueueFull:

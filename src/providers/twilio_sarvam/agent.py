@@ -591,13 +591,23 @@ class TwilioSarvamAgent(BaseVoiceAgent):
         # Slow path: full-response-then-speak.
         logger.info(f"Generating live greeting for {session.subscriber.name}")
         period = session.time_period  # memoized at session creation
-        # 'late' (midnight–5 AM) is unusual — skip the time-of-day phrase then.
-        time_greeting = f"good {period}" if period != "late" else "hello"
+
+        # Clean per-period opener — one natural phrase, no "Hi, hello" mashups.
+        time_opener = {
+            "morning": "Good morning",
+            "afternoon": "Good afternoon",
+            "evening": "Good evening",
+            "late": "Hello",  # outside civil hours — skip time-of-day
+        }.get(period, "Hello")
+
+        # First-name only sounds warmer than "Mr. FirstName LastName".
+        first_name = (session.subscriber.name or "").split()[0] or "there"
+
         greeting_prompt = (
-            "[SYSTEM: Call connected. Open with ONE warm, natural line like: "
-            f"\"Hi, {time_greeting}, am I speaking to Mr. {session.subscriber.name}?\". "
-            "Use that exact shape. Don't introduce the company yet — save that "
-            "for after they confirm. MAX 15 WORDS.]"
+            "[SYSTEM: Call connected. Say exactly one warm, natural opener "
+            f"in this shape: \"{time_opener}, am I speaking with {first_name}?\" "
+            "Nothing else. No 'Hi', no double-greeting, no company pitch yet. "
+            "Keep it under 10 words and sound like a real person, not a script.]"
         )
         session.conversation.message_history.append(
             {"role": "user", "content": greeting_prompt}
