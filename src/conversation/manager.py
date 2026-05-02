@@ -47,6 +47,16 @@ _STATE_KEYWORDS = {
     ],
 }
 
+# Caller said yes / agreed in some form. Used to advance RENEWAL_PITCH →
+# COLLECTING_PAYMENT once the caller has signalled they want to renew, so
+# the LLM stops re-pitching and moves to payment collection.
+_AFFIRMATIVE_KEYWORDS = [
+    "yes", "yeah", "yep", "yup", "sure", "okay", "ok", "alright",
+    "absolutely", "definitely", "of course", "go ahead", "please do",
+    "subscribe", "renew", "confirm", "agree", "agreed", "let's do it",
+    "sounds good", "i'm in", "count me in",
+]
+
 
 class ConversationManager:
     """Manages conversation state, message history, and transcript for a single call."""
@@ -67,6 +77,12 @@ class ConversationManager:
         self.transcript: List[dict] = []
         self.message_history: List[dict] = []
         self.is_agent_speaking = False
+        # Monotonic id incremented every time a barge-in fires. Speakers
+        # capture the id at the start of an utterance and bail out if the
+        # current id no longer matches — race-free vs. is_agent_speaking,
+        # which gets reset by `finally:` blocks even on normal completion
+        # and can be observed False mid-stream by concurrent tasks.
+        self.speak_session_id: int = 0
         self._accumulated_text = ""
 
         # Barge-in / flow memory — populated after every agent turn.
@@ -120,6 +136,20 @@ class ConversationManager:
         ):
             self.state = ConversationState.CLOSING
             return
+
+        # Caller affirmed during the renewal pitch → advance to payment.
+        # Without this, the LLM stays in RENEWAL_PITCH and keeps re-asking
+        # "would you like to go ahead?" even after the caller said yes.
+        if self.state is ConversationState.RENEWAL_PITCH and self._contains_any_word(
+            last_user_text, _AFFIRMATIVE_KEYWORDS
+        ):
+            self.state = ConversationState.COLLECTING_PAYMENT
+            self.goal = (
+                "Caller has confirmed renewal. Collect payment method next "
+                "(UPI / card / net banking) and offer to send a payment link."
+            )
+            return
+
         for state, keywords in _STATE_KEYWORDS.items():
             if state is ConversationState.CLOSING:
                 continue
@@ -148,7 +178,11 @@ class ConversationManager:
                 f"only if still relevant."
             )
         elif self.last_turn_heard:
-            parts.append(f"Your last reply (fully delivered): {self.last_turn_heard!r}")
+            parts.append(
+                f"Your last reply (fully delivered): {self.last_turn_heard!r}. "
+                f"DO NOT repeat it or re-pitch the same content. Move the call "
+                f"forward — answer the caller's latest input or advance the goal."
+            )
         return "\n".join(f"- {p}" for p in parts)
 
     def build_messages(self, user_text: str) -> List[dict]:
@@ -156,6 +190,13 @@ class ConversationManager:
         Append user turn to history and return message list for LLM with a
         fresh "Call State" block injected so the LLM always has current goal
         and any interruption memory.
+
+        Consecutive user turns get COLLAPSED into one message — Sarvam STT
+        often splits a continuous utterance ("Yes, I would like to subscribe.")
+        into multiple final transcripts as VAD fires on micro-pauses
+        ("Yes, I would like." → "Like to subscribe."). Treating each as a
+        separate user turn produces consecutive `role: user` messages, which
+        confuse the LLM into re-pitching instead of advancing the call.
         """
         self.transcript.append(
             {
@@ -164,7 +205,23 @@ class ConversationManager:
                 "timestamp": datetime.now().isoformat(),
             }
         )
-        self.message_history.append({"role": "user", "content": user_text})
+
+        if self.message_history and self.message_history[-1]["role"] == "user":
+            prev = self.message_history[-1]["content"].strip()
+            curr = user_text.strip()
+            # Common STT cascade: each new transcript is a longer/cleaner
+            # version of the prior one. Prefer the longer text.
+            if curr.lower().startswith(prev.lower()) or len(curr) >= len(prev):
+                self.message_history[-1]["content"] = curr
+            elif prev.lower().startswith(curr.lower()):
+                # Already have superset; keep it.
+                pass
+            else:
+                # Genuinely additive — concatenate so the LLM sees the full
+                # statement rather than fragments.
+                self.message_history[-1]["content"] = f"{prev} {curr}"
+        else:
+            self.message_history.append({"role": "user", "content": user_text})
 
         # Clone history with a state-augmented system prompt so the LLM always
         # has fresh memory of where the call is — without mutating the stored
@@ -264,9 +321,19 @@ class ConversationManager:
         self._accumulated_text = ""
         return text if text else None
 
+    def bump_speak_session(self) -> int:
+        """
+        Increment the speak session id. Returns the NEW id. Any speaker
+        currently looping on the previous id will see the mismatch on its
+        next iteration and stop.
+        """
+        self.speak_session_id += 1
+        return self.speak_session_id
+
     def handle_barge_in(self) -> None:
         """User spoke while agent was speaking — mark for interruption handling."""
         self.is_agent_speaking = False
+        self.bump_speak_session()
         self._accumulated_text = ""
         logger.debug("Barge-in detected")
 

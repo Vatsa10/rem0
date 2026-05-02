@@ -52,6 +52,9 @@ class CallSession:
     _pending_task_lock: Optional[asyncio.Lock] = field(default=None)
     last_partial_text: str = ""
     last_partial_time: float = 0.0
+    # Per-turn latency anchors. Set when the user's STT final transcript
+    # arrives; turn code reads them to compute end-to-end latency_ms.
+    last_stt_final_time: float = 0.0
 
 
 class TwilioSarvamAgent(BaseVoiceAgent):
@@ -403,6 +406,7 @@ class TwilioSarvamAgent(BaseVoiceAgent):
                 if is_final:
                     logger.info(f"STT final transcript: {transcript!r}")
                     session.last_partial_text = ""
+                    session.last_stt_final_time = time.monotonic()
 
                     # Cancel any in-flight turn — the caller has said
                     # something new, superseding whatever we were working on.
@@ -463,16 +467,28 @@ class TwilioSarvamAgent(BaseVoiceAgent):
             f"user={user_text!r})"
         )
 
+        # Latency anchors (monotonic, seconds). Computed at end as ms deltas.
+        t_stt = session.last_stt_final_time or time.monotonic()
+        t_llm_start = time.monotonic()
+        t_llm_first_token: Optional[float] = None
+        t_llm_done: Optional[float] = None
+        t_first_audio: Optional[float] = None
+
         # Phase 1 — collect full LLM response (no audio yet).
+        # max_tokens=200 covers a 30-word reply with comfortable headroom.
+        # The system prompt's "≤20 words per turn" rule already constrains
+        # length; we just don't want a hard cap to ever cut a sentence.
         full_response = ""
         llm_failed = False
         try:
             async for token in session.llm.chat_completion_stream(
                 messages=messages,
                 temperature=0.5,
-                max_tokens=60,
+                max_tokens=200,
                 fast=fast,
             ):
+                if t_llm_first_token is None:
+                    t_llm_first_token = time.monotonic()
                 full_response += token
         except asyncio.CancelledError:
             logger.debug("LLM generation cancelled before speak phase")
@@ -487,6 +503,8 @@ class TwilioSarvamAgent(BaseVoiceAgent):
             )
             llm_failed = True
 
+        t_llm_done = time.monotonic()
+
         if llm_failed:
             reply = "Sorry, I had a brief hiccup — could you repeat that?"
         else:
@@ -498,21 +516,40 @@ class TwilioSarvamAgent(BaseVoiceAgent):
             return
 
         # Phase 2 — speak the complete reply as one utterance.
+        # Claim a new speak session id; barge-in increments past this id to
+        # invalidate the speaker. Avoids the false-cancel race where finally:
+        # blocks reset is_agent_speaking even on normal completion.
+        local_id = session.conversation.bump_speak_session()
         session.conversation.is_agent_speaking = True
         heard = ""
         try:
-            _, heard = await self._speak(session, websocket, reply)
+            _, heard, t_first_audio = await self._speak(
+                session, websocket, reply, speak_id=local_id
+            )
             logger.info(f"LLM turn heard: {heard!r}")
         except asyncio.CancelledError:
             logger.debug("Turn cancelled during speak phase")
             raise
         finally:
-            session.conversation.is_agent_speaking = False
+            # Only flip the flag if we're still the active speaker; barge-in
+            # already flipped it if it fired during the turn.
+            if session.conversation.speak_session_id == local_id:
+                session.conversation.is_agent_speaking = False
             # Always update state + barge-in memory, even on cancellation.
             session.conversation.record_turn_result(
                 user_text=user_text,
                 generated=reply,
                 heard=heard,
+            )
+            t_done = time.monotonic()
+            self._log_turn_latency(
+                t_stt=t_stt,
+                t_llm_start=t_llm_start,
+                t_llm_first_token=t_llm_first_token,
+                t_llm_done=t_llm_done,
+                t_first_audio=t_first_audio,
+                t_done=t_done,
+                tag="turn",
             )
 
     async def _send_greeting(
@@ -540,21 +577,20 @@ class TwilioSarvamAgent(BaseVoiceAgent):
 
         # Fast path: cached audio, stream directly to Twilio.
         if session.cached_greeting:
-            logger.info(
-                f"Serving cached greeting ({len(session.cached_greeting)} bytes)"
-            )
+            total_audio_bytes = len(session.cached_greeting)
+            logger.info(f"Serving cached greeting ({total_audio_bytes} bytes)")
+            local_id = session.conversation.bump_speak_session()
             session.conversation.is_agent_speaking = True
             chunk_size = 640  # 80ms of mulaw @ 8kHz
-            total_audio_bytes = len(session.cached_greeting)
             bytes_sent = 0
             interrupted = False
+            send_failed = False
+            t_speak_start = time.monotonic()
             try:
                 for i in range(0, total_audio_bytes, chunk_size):
-                    if not session.conversation.is_agent_speaking:
+                    # Race-free barge-in check via session id.
+                    if session.conversation.speak_session_id != local_id:
                         interrupted = True
-                        # Explicitly flush Twilio buffer in case barge-in
-                        # fired between two chunks without _trigger_barge_in
-                        # seeing is_agent_speaking == True anymore.
                         try:
                             await session.twilio_handler.send_clear(websocket)
                         except Exception:
@@ -562,18 +598,36 @@ class TwilioSarvamAgent(BaseVoiceAgent):
                         break
                     chunk = session.cached_greeting[i : i + chunk_size]
                     try:
-                        await session.twilio_handler.send_audio(websocket, chunk)
+                        ok = await session.twilio_handler.send_audio(
+                            websocket, chunk
+                        )
                     except asyncio.CancelledError:
                         raise
                     except Exception as e:
-                        logger.warning(f"Greeting send_audio failed: {e}")
+                        logger.warning(f"Greeting send_audio raised {e!r}")
+                        send_failed = True
+                        break
+                    if not ok:
+                        logger.warning("Greeting send_audio dropped frame")
+                        send_failed = True
                         break
                     bytes_sent += len(chunk)
                     await asyncio.sleep(0.08)  # pace to real-time playback
 
+                # Truncation/short-audio telemetry.
+                actual_sec = bytes_sent / self._TWILIO_BYTES_PER_SEC
+                expected_sec = total_audio_bytes / self._TWILIO_BYTES_PER_SEC
+                wall_sec = time.monotonic() - t_speak_start
+                logger.info(
+                    f"Cached greeting done: bytes_sent={bytes_sent}, "
+                    f"audio_sec={actual_sec:.2f}, expected_sec={expected_sec:.2f}, "
+                    f"wall_sec={wall_sec:.2f}, interrupted={interrupted}, "
+                    f"send_failed={send_failed}"
+                )
+
                 if session.cached_greeting_text:
                     # On interrupt, record only the portion the caller heard.
-                    if interrupted:
+                    if interrupted or send_failed:
                         heard = self._estimate_heard_text(
                             session.cached_greeting_text, bytes_sent
                         )
@@ -585,7 +639,8 @@ class TwilioSarvamAgent(BaseVoiceAgent):
                         heard=heard,
                     )
             finally:
-                session.conversation.is_agent_speaking = False
+                if session.conversation.speak_session_id == local_id:
+                    session.conversation.is_agent_speaking = False
             return
 
         # Slow path: full-response-then-speak.
@@ -614,12 +669,14 @@ class TwilioSarvamAgent(BaseVoiceAgent):
         )
 
         # Phase 1 — collect full greeting text (no audio yet).
+        # 100 tokens covers a ~12-word opener with comfortable headroom; the
+        # prompt itself caps to "under 10 words" so this is just safety.
         full_response = ""
         try:
             async for token in session.llm.chat_completion_stream(
                 messages=session.conversation.message_history,
                 temperature=0.5,
-                max_tokens=50,
+                max_tokens=100,
                 fast=True,
             ):
                 full_response += token
@@ -636,26 +693,63 @@ class TwilioSarvamAgent(BaseVoiceAgent):
 
         # Phase 2 — synthesize full utterance, stream to Twilio, and collect
         # raw mulaw bytes for caching.
+        local_id = session.conversation.bump_speak_session()
         session.conversation.is_agent_speaking = True
         collected_audio = bytearray()
         sent = 0
         interrupted = False
+        send_failed = False
         mark_id = str(uuid.uuid4())[:8]
+        t_speak_start = time.monotonic()
 
         try:
             async for audio_chunk in session.tts.synthesize(reply):
                 collected_audio.extend(audio_chunk)
-                if not session.conversation.is_agent_speaking:
+                if session.conversation.speak_session_id != local_id:
                     interrupted = True
                     break
-                await session.twilio_handler.send_audio(websocket, audio_chunk)
+                try:
+                    ok = await session.twilio_handler.send_audio(
+                        websocket, audio_chunk
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logger.warning(f"Greeting send_audio raised {e!r}")
+                    send_failed = True
+                    break
+                if not ok:
+                    logger.warning("Greeting send_audio dropped frame")
+                    send_failed = True
+                    break
                 sent += len(audio_chunk)
-            await session.twilio_handler.send_mark(websocket, mark_id)
+                # Real-time pacing (see _speak for rationale).
+                await asyncio.sleep(len(audio_chunk) / self._TWILIO_BYTES_PER_SEC)
+            try:
+                await session.twilio_handler.send_mark(websocket, mark_id)
+            except Exception as e:
+                logger.debug(f"Greeting send_mark failed: {e}")
 
-            heard = reply if not interrupted else self._estimate_heard_text(reply, sent)
+            words = max(1, len(reply.split()))
+            expected_sec = words / self._WORDS_PER_SEC
+            actual_sec = sent / self._TWILIO_BYTES_PER_SEC
+            wall_sec = time.monotonic() - t_speak_start
+
+            played_full = not (interrupted or send_failed)
+            if played_full and actual_sec < 0.7 * expected_sec:
+                logger.warning(
+                    f"Greeting: short audio — {actual_sec:.2f}s shipped vs "
+                    f"~{expected_sec:.2f}s expected for {words}-word reply "
+                    f"{reply!r}; possible TTS truncation. Skipping cache write."
+                )
+                played_full = False  # don't cache a truncated greeting
+
+            heard = reply if played_full else self._estimate_heard_text(reply, sent)
             logger.info(
                 f"Greeting done: heard={heard!r}, audio_sent={sent}B, "
-                f"interrupted={interrupted}"
+                f"audio_sec={actual_sec:.2f}, expected_sec={expected_sec:.2f}, "
+                f"wall_sec={wall_sec:.2f}, interrupted={interrupted}, "
+                f"send_failed={send_failed}"
             )
 
             # Replace the fake prompt in history with the real turn outcome,
@@ -668,8 +762,9 @@ class TwilioSarvamAgent(BaseVoiceAgent):
                     heard=heard,
                 )
 
-            # Only cache greetings that played fully through (consistent audio ↔ text).
-            if not interrupted and collected_audio and heard:
+            # Only cache greetings that played fully through AND match the
+            # expected duration (so a truncated stream isn't cached as canon).
+            if played_full and collected_audio and heard:
                 await self.greeting_cache.set(
                     session.subscriber.language,
                     session.tts.voice,
@@ -687,7 +782,8 @@ class TwilioSarvamAgent(BaseVoiceAgent):
                     heard,
                 )
         finally:
-            session.conversation.is_agent_speaking = False
+            if session.conversation.speak_session_id == local_id:
+                session.conversation.is_agent_speaking = False
 
     # Twilio plays mulaw at 8000 bytes/sec; natural speech is ~2.5 words/sec.
     _TWILIO_BYTES_PER_SEC = 8000
@@ -729,39 +825,126 @@ class TwilioSarvamAgent(BaseVoiceAgent):
         return " ".join(words[:words_heard])
 
     async def _speak(
-        self, session: CallSession, websocket: WebSocket, text: str
-    ) -> tuple[bool, str]:
+        self,
+        session: CallSession,
+        websocket: WebSocket,
+        text: str,
+        speak_id: Optional[int] = None,
+    ) -> tuple[bool, str, Optional[float]]:
         """
         Stream text to TTS → Twilio as a single utterance.
 
+        Args:
+            speak_id: the speak_session_id captured at the start of the turn.
+                Loop bails if `mgr.speak_session_id` no longer matches (barge-in
+                bumped past us). If None, falls back to is_agent_speaking
+                (legacy callers).
+
         Returns:
-            (spoke_fully, heard_text)
-              spoke_fully — True if the entire utterance reached Twilio.
-              heard_text  — full `text` if uninterrupted, else a word-aligned
-                            prefix estimated from bytes streamed.
+            (spoke_fully, heard_text, t_first_audio)
+              spoke_fully    — True if the entire utterance reached Twilio.
+              heard_text     — full `text` if uninterrupted, else a word-aligned
+                               prefix estimated from bytes streamed.
+              t_first_audio  — monotonic time when first byte was sent to Twilio
+                               (for latency telemetry); None if nothing was sent.
         """
         mark_id = str(uuid.uuid4())[:8]
         sent = 0
         interrupted = False
+        send_failed = False
+        t_first_audio: Optional[float] = None
+        t_speak_start = time.monotonic()
 
         async for audio_chunk in session.tts.synthesize(text):
-            if not session.conversation.is_agent_speaking:
+            # Barge-in check via session id (race-free). Falls back to
+            # is_agent_speaking for callers that didn't pass speak_id.
+            if speak_id is not None:
+                if session.conversation.speak_session_id != speak_id:
+                    interrupted = True
+                    break
+            elif not session.conversation.is_agent_speaking:
                 interrupted = True
                 break
-            await session.twilio_handler.send_audio(websocket, audio_chunk)
+            try:
+                ok = await session.twilio_handler.send_audio(websocket, audio_chunk)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning(f"_speak: send_audio raised {e!r}; aborting utterance")
+                send_failed = True
+                break
+            if not ok:
+                # stream_sid not yet ready or Twilio dropped the frame.
+                logger.warning("_speak: send_audio dropped frame; aborting utterance")
+                send_failed = True
+                break
+            if t_first_audio is None:
+                t_first_audio = time.monotonic()
             sent += len(audio_chunk)
+            # Pace at real-time (8000 mulaw bytes/sec). Without this we blast
+            # the whole utterance into Twilio's buffer in milliseconds; barge-in
+            # then has nothing to clear because Twilio already started playback,
+            # and frame-pressure can produce choppy / "breaking" audio.
+            await asyncio.sleep(len(audio_chunk) / self._TWILIO_BYTES_PER_SEC)
+
+        # Truncation telemetry — compare actual vs expected speech duration.
+        words = max(1, len(text.split()))
+        expected_sec = words / self._WORDS_PER_SEC
+        actual_sec = sent / self._TWILIO_BYTES_PER_SEC
+        wall_sec = time.monotonic() - t_speak_start
+        if not interrupted and not send_failed and actual_sec < 0.7 * expected_sec:
+            logger.warning(
+                f"_speak: short audio — {actual_sec:.2f}s shipped vs ~{expected_sec:.2f}s "
+                f"expected for {words}-word reply {text!r}; possible TTS truncation"
+            )
 
         if interrupted:
             heard = self._estimate_heard_text(text, sent)
-            logger.debug(
-                f"Spoke (interrupted): {text!r} -> heard {heard!r} ({sent}B)"
-            )
+        elif send_failed:
+            heard = self._estimate_heard_text(text, sent)
         else:
             heard = text
-            logger.debug(f"Spoke: {text!r} ({sent}B)")
+        logger.info(
+            f"_speak done: bytes={sent}, audio_sec={actual_sec:.2f}, "
+            f"expected_sec={expected_sec:.2f}, wall_sec={wall_sec:.2f}, "
+            f"interrupted={interrupted}, send_failed={send_failed}"
+        )
 
-        await session.twilio_handler.send_mark(websocket, mark_id)
-        return (not interrupted), heard
+        try:
+            await session.twilio_handler.send_mark(websocket, mark_id)
+        except Exception as e:
+            logger.debug(f"_speak: send_mark failed: {e}")
+        return (not (interrupted or send_failed)), heard, t_first_audio
+
+    def _log_turn_latency(
+        self,
+        *,
+        t_stt: float,
+        t_llm_start: float,
+        t_llm_first_token: Optional[float],
+        t_llm_done: Optional[float],
+        t_first_audio: Optional[float],
+        t_done: float,
+        tag: str,
+    ) -> None:
+        """
+        One INFO line per turn with end-to-end latency breakdown.
+        All numbers are ms; "—" means the anchor wasn't reached (e.g. LLM
+        failed before yielding any token).
+        """
+        def ms(t0: Optional[float], t1: Optional[float]) -> str:
+            if t0 is None or t1 is None:
+                return "—"
+            return f"{(t1 - t0) * 1000:.0f}"
+
+        logger.info(
+            f"latency_ms[{tag}] "
+            f"stt_to_llm={ms(t_stt, t_llm_start)} "
+            f"llm_first_token={ms(t_llm_start, t_llm_first_token)} "
+            f"llm_total={ms(t_llm_start, t_llm_done)} "
+            f"to_first_audio={ms(t_stt, t_first_audio)} "
+            f"total={ms(t_stt, t_done)}"
+        )
 
     async def _cleanup_session(self, session: CallSession, call_id: str) -> None:
         """

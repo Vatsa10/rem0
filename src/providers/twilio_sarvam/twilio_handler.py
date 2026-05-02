@@ -30,6 +30,9 @@ class TwilioMediaStreamHandler:
         # Producers must await this before calling send_audio/send_mark/send_clear
         # — otherwise send calls silently drop because stream_sid is None.
         self._ready_event = asyncio.Event()
+        # Latch so we only WARN once per call about a missing stream_sid,
+        # rather than spamming logs on every dropped frame.
+        self._warned_no_stream_sid = False
 
     async def wait_until_ready(self, timeout: float = 5.0) -> bool:
         """Block until the `start` event has been seen (stream_sid available)."""
@@ -74,10 +77,22 @@ class TwilioMediaStreamHandler:
 
         return message
 
-    async def send_audio(self, websocket: WebSocket, audio_bytes: bytes) -> None:
-        """Send audio to Twilio as a media message."""
+    async def send_audio(self, websocket: WebSocket, audio_bytes: bytes) -> bool:
+        """
+        Send audio to Twilio as a media message.
+
+        Returns True on a successful send, False if the stream_sid isn't
+        available yet (frame silently dropped — caller can detect this and
+        decide whether to retry, abort, or surface the issue).
+        """
         if not self.state.stream_sid:
-            return
+            if not self._warned_no_stream_sid:
+                self._warned_no_stream_sid = True
+                logger.warning(
+                    "send_audio called before Twilio `start` event — "
+                    "frame dropped; producer should await wait_until_ready()"
+                )
+            return False
         message = {
             "event": "media",
             "streamSid": self.state.stream_sid,
@@ -86,6 +101,7 @@ class TwilioMediaStreamHandler:
             },
         }
         await websocket.send_json(message)
+        return True
 
     async def send_mark(self, websocket: WebSocket, mark_name: str) -> None:
         """Send a mark message to track audio playback completion."""

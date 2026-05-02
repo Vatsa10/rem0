@@ -53,6 +53,11 @@ async def startup():
     # Pre-connect greeting cache (Memurai/Redis on localhost:6379 by default).
     cache = get_greeting_cache()
     await cache.connect()
+    try:
+        stats = await cache.stats()
+        logger.info(f"Greeting cache stats: {stats}")
+    except Exception as e:
+        logger.debug(f"Greeting cache stats failed: {e}")
 
     # Pre-warm the automation + LLM HTTP connection pool.
     automation = await get_automation()

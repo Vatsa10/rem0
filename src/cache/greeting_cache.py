@@ -45,7 +45,8 @@ class GreetingCache:
         self, language: str, voice: str, time_period: str, company: str, agent: str
     ) -> str:
         h = hashlib.md5(f"{company}|{agent}".encode()).hexdigest()[:8]
-        return f"greeting:v3:{language}:{voice}:{time_period}:{h}"
+        # v4 = post inactivity-timeout fix; v3 entries were truncated mid-greeting.
+        return f"greeting:v4:{language}:{voice}:{time_period}:{h}"
 
     async def get(
         self, language: str, voice: str, time_period: str, company: str, agent: str
@@ -116,6 +117,27 @@ class GreetingCache:
             logger.info("Greeting cache invalidated")
         except Exception as e:
             logger.warning(f"Cache invalidate failed: {e}")
+
+    async def stats(self) -> dict:
+        """Count active v4 greeting entries (audio + text) in Redis."""
+        if not self._client:
+            return {"connected": False}
+        try:
+            audio_keys = 0
+            text_keys = 0
+            async for key in self._client.scan_iter(match="greeting:v4:*"):
+                if key.endswith(b":text"):
+                    text_keys += 1
+                else:
+                    audio_keys += 1
+            return {
+                "connected": True,
+                "audio_entries": audio_keys,
+                "text_entries": text_keys,
+            }
+        except Exception as e:
+            logger.warning(f"Cache stats failed: {e}")
+            return {"connected": True, "error": str(e)}
 
 
 _cache_singleton: Optional[GreetingCache] = None

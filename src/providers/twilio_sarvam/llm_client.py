@@ -51,6 +51,10 @@ class LLMClient:
                 "Content-Type": "application/json",
             },
         )
+        # Last finish_reason from the most recent stream call ("stop",
+        # "length", "tool_calls", etc.). Read from `_run_turn` so we can
+        # detect mid-sentence cutoffs caused by max_tokens being too low.
+        self.last_finish_reason: Optional[str] = None
 
     async def warmup(self) -> None:
         try:
@@ -124,6 +128,11 @@ class LLMClient:
             "stream": True,
         }
 
+        # Reset before each call so a stale value from a previous call
+        # doesn't leak into the next turn's logging.
+        self.last_finish_reason = None
+        finish_reason: Optional[str] = None
+
         async with self._client.stream("POST", self.url, json=payload) as response:
             if response.status_code >= 400:
                 body = (await response.aread()).decode("utf-8", errors="replace")
@@ -139,15 +148,28 @@ class LLMClient:
                     continue
                 data = line[6:]
                 if data == "[DONE]":
-                    return
+                    break
                 try:
                     chunk = json.loads(data)
-                    delta = chunk["choices"][0].get("delta", {})
+                    choice = chunk["choices"][0]
+                    delta = choice.get("delta", {})
                     content = delta.get("content", "")
+                    fr = choice.get("finish_reason")
+                    if fr:
+                        finish_reason = fr
                     if content:
                         yield content
                 except (json.JSONDecodeError, KeyError, IndexError):
                     continue
+
+        self.last_finish_reason = finish_reason
+        if finish_reason and finish_reason != "stop":
+            logger.warning(
+                f"LLM finish_reason={finish_reason!r} for model={model!r} — "
+                f"reply may be truncated; consider raising max_tokens"
+            )
+        else:
+            logger.info(f"LLM finish_reason={finish_reason!r} for model={model!r}")
 
     async def chat_completion(
         self,

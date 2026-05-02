@@ -2,6 +2,7 @@ import asyncio
 import base64
 import json
 import logging
+import time
 from typing import AsyncGenerator, Optional
 
 import websockets
@@ -106,7 +107,12 @@ class SarvamTTSClient:
                 "output_audio_codec": "mulaw",
                 "speech_sample_rate": "8000",
                 "temperature": 0.5,
-                "min_buffer_size": 50,
+                # min_buffer_size=1: ship every word to the model immediately.
+                # With 50 (the previous value), short utterances (~40 chars)
+                # got stuck in Sarvam's input buffer waiting for more text;
+                # `flush` would then close out the synth before the tail audio
+                # was generated, producing truncated greetings.
+                "min_buffer_size": 1,
                 "send_completion_event": True,
             },
         }
@@ -240,19 +246,48 @@ class SarvamTTSClient:
             logger.error(f"TTS send error: {e}")
             return
 
-        FIRST_CHUNK_TIMEOUT = 5.0    # allow some cold-start latency
-        INACTIVITY_TIMEOUT = 0.4     # Sarvam streams fast — 400ms gap = done
+        # First chunk allows model warmup. Inactivity between chunks must be
+        # lenient — bulbul:v3 inserts natural pauses between phrases that
+        # can exceed 1s on longer text. Trust `event_type:"final"` (enabled
+        # via send_completion_event=True) for normal completion; inactivity
+        # timeout is a hard safety net only.
+        FIRST_CHUNK_TIMEOUT = 5.0
+        INACTIVITY_TIMEOUT = 8.0
+        # Even after `final` arrives, give the queue a brief drain window so
+        # any audio chunks still in flight from the network land before we
+        # exit the loop (belt-and-suspenders for ordering across the WS).
+        POST_FINAL_DRAIN_SEC = 0.25
 
         chunks_yielded = 0
         bytes_yielded = 0
         timeout = FIRST_CHUNK_TIMEOUT
+        end_reason = "unknown"
+        t_start = time.monotonic()
 
         while True:
             try:
                 chunk = await asyncio.wait_for(self._audio_queue.get(), timeout=timeout)
                 if chunk is None:
+                    end_reason = "final_event"
+                    drain_until = time.monotonic() + POST_FINAL_DRAIN_SEC
+                    while time.monotonic() < drain_until:
+                        try:
+                            extra = await asyncio.wait_for(
+                                self._audio_queue.get(),
+                                timeout=max(0.02, drain_until - time.monotonic()),
+                            )
+                        except asyncio.TimeoutError:
+                            break
+                        if extra is None:
+                            continue
+                        if self._cancelled:
+                            break
+                        chunks_yielded += 1
+                        bytes_yielded += len(extra)
+                        yield extra
                     break
                 if self._cancelled:
+                    end_reason = "cancelled"
                     break
                 chunks_yielded += 1
                 bytes_yielded += len(chunk)
@@ -260,11 +295,35 @@ class SarvamTTSClient:
                 timeout = INACTIVITY_TIMEOUT
             except asyncio.TimeoutError:
                 if chunks_yielded == 0:
+                    end_reason = "no_first_chunk"
                     logger.warning(f"TTS: no audio in {timeout}s for text {clean!r}")
+                else:
+                    end_reason = "inactivity_timeout"
+                    logger.warning(
+                        f"TTS: inactivity_timeout after {chunks_yielded} chunks "
+                        f"({bytes_yielded}B) for text {clean!r} — tail likely "
+                        f"truncated; raise INACTIVITY_TIMEOUT if frequent"
+                    )
                 break
 
-        logger.debug(
-            f"TTS synthesize complete: {chunks_yielded} chunks, {bytes_yielded}B"
+        # Sanity check — if delivered audio is much shorter than expected for
+        # the given text, that's a strong truncation signal worth a WARN.
+        # Heuristic: ~3 wps fluent phone speech.
+        words = max(1, len(clean.split()))
+        expected_sec = words / 3.0
+        actual_sec = bytes_yielded / 8000.0
+        wall_sec = time.monotonic() - t_start
+        if end_reason == "final_event" and actual_sec < 0.6 * expected_sec:
+            logger.warning(
+                f"TTS: short audio — actual {actual_sec:.2f}s vs expected "
+                f"{expected_sec:.2f}s for {words}-word text {clean!r}. "
+                f"Possible model/server-side truncation."
+            )
+
+        logger.info(
+            f"TTS synthesize complete: chunks={chunks_yielded}, bytes={bytes_yielded}, "
+            f"audio_sec={actual_sec:.2f}, expected_sec={expected_sec:.2f}, "
+            f"wall_sec={wall_sec:.2f}, end_reason={end_reason}"
         )
 
     def cancel(self) -> None:
