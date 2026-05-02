@@ -107,12 +107,13 @@ class SarvamTTSClient:
                 "output_audio_codec": "mulaw",
                 "speech_sample_rate": "8000",
                 "temperature": 0.5,
-                # min_buffer_size=1: ship every word to the model immediately.
-                # With 50 (the previous value), short utterances (~40 chars)
-                # got stuck in Sarvam's input buffer waiting for more text;
-                # `flush` would then close out the synth before the tail audio
-                # was generated, producing truncated greetings.
-                "min_buffer_size": 1,
+                # min_buffer_size omitted on purpose — Sarvam rejected
+                # min_buffer_size=1 with 422 "Input parameters has to be a
+                # valid dictionary", which closed the WS and left every
+                # subsequent synthesize() bailing with "not open". Letting
+                # Sarvam use its server-side default keeps the connection
+                # healthy. If we ever need to tune it, valid range needs
+                # to come from Sarvam docs first.
                 "send_completion_event": True,
             },
         }

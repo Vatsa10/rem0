@@ -55,6 +55,13 @@ class CallSession:
     # Per-turn latency anchors. Set when the user's STT final transcript
     # arrives; turn code reads them to compute end-to-end latency_ms.
     last_stt_final_time: float = 0.0
+    # Running estimate of how much of the current utterance the caller has
+    # already heard (word-aligned prefix). Updated by `_speak` after each
+    # chunk reaches Twilio, so a cancelled mid-speak turn can still record
+    # the agent line into the transcript via `record_turn_result`. Without
+    # this, an interrupted reply that finished speaking before the task got
+    # cancelled disappears from call history entirely.
+    last_speak_partial: str = ""
 
 
 class TwilioSarvamAgent(BaseVoiceAgent):
@@ -528,7 +535,11 @@ class TwilioSarvamAgent(BaseVoiceAgent):
             )
             logger.info(f"LLM turn heard: {heard!r}")
         except asyncio.CancelledError:
-            logger.debug("Turn cancelled during speak phase")
+            # _speak was cancelled mid-stream — pull the running partial it
+            # published on the session so the agent's spoken prefix still
+            # makes it into the transcript / call history.
+            heard = session.last_speak_partial or ""
+            logger.debug(f"Turn cancelled during speak phase; heard={heard!r}")
             raise
         finally:
             # Only flip the flag if we're still the active speaker; barge-in
@@ -586,6 +597,9 @@ class TwilioSarvamAgent(BaseVoiceAgent):
             interrupted = False
             send_failed = False
             t_speak_start = time.monotonic()
+            session.last_speak_partial = ""
+            cached_text = session.cached_greeting_text or ""
+            heard = ""
             try:
                 for i in range(0, total_audio_bytes, chunk_size):
                     # Race-free barge-in check via session id.
@@ -612,6 +626,10 @@ class TwilioSarvamAgent(BaseVoiceAgent):
                         send_failed = True
                         break
                     bytes_sent += len(chunk)
+                    if cached_text:
+                        session.last_speak_partial = self._estimate_heard_text(
+                            cached_text, bytes_sent
+                        )
                     await asyncio.sleep(0.08)  # pace to real-time playback
 
                 # Truncation/short-audio telemetry.
@@ -625,22 +643,28 @@ class TwilioSarvamAgent(BaseVoiceAgent):
                     f"send_failed={send_failed}"
                 )
 
-                if session.cached_greeting_text:
-                    # On interrupt, record only the portion the caller heard.
+                if cached_text:
                     if interrupted or send_failed:
-                        heard = self._estimate_heard_text(
-                            session.cached_greeting_text, bytes_sent
-                        )
+                        heard = self._estimate_heard_text(cached_text, bytes_sent)
                     else:
-                        heard = session.cached_greeting_text
-                    session.conversation.record_turn_result(
-                        user_text="",
-                        generated=session.cached_greeting_text,
-                        heard=heard,
-                    )
+                        heard = cached_text
+            except asyncio.CancelledError:
+                # Mid-stream cancel — pick up whatever we've shipped so the
+                # agent's greeting prefix still lands in the transcript.
+                if cached_text:
+                    heard = self._estimate_heard_text(cached_text, bytes_sent)
+                raise
             finally:
                 if session.conversation.speak_session_id == local_id:
                     session.conversation.is_agent_speaking = False
+                # Record outside the inner try so any path (normal / barge-in /
+                # cancel / send_failed) writes the agent turn into transcript.
+                if cached_text and heard:
+                    session.conversation.record_turn_result(
+                        user_text="",
+                        generated=cached_text,
+                        heard=heard,
+                    )
             return
 
         # Slow path: full-response-then-speak.
@@ -701,6 +725,17 @@ class TwilioSarvamAgent(BaseVoiceAgent):
         send_failed = False
         mark_id = str(uuid.uuid4())[:8]
         t_speak_start = time.monotonic()
+        session.last_speak_partial = ""
+        # Pop the synthetic greeting prompt from history right away — we
+        # never want it to leak into a subsequent LLM turn even if this
+        # function is cancelled mid-stream.
+        if (
+            session.conversation.message_history
+            and session.conversation.message_history[-1].get("role") == "user"
+        ):
+            session.conversation.message_history.pop(-1)
+        heard = ""
+        played_full = False
 
         try:
             async for audio_chunk in session.tts.synthesize(reply):
@@ -723,6 +758,7 @@ class TwilioSarvamAgent(BaseVoiceAgent):
                     send_failed = True
                     break
                 sent += len(audio_chunk)
+                session.last_speak_partial = self._estimate_heard_text(reply, sent)
                 # Real-time pacing (see _speak for rationale).
                 await asyncio.sleep(len(audio_chunk) / self._TWILIO_BYTES_PER_SEC)
             try:
@@ -752,16 +788,6 @@ class TwilioSarvamAgent(BaseVoiceAgent):
                 f"send_failed={send_failed}"
             )
 
-            # Replace the fake prompt in history with the real turn outcome,
-            # and let record_turn_result update state + barge-in memory.
-            session.conversation.message_history.pop(-1)
-            if heard:
-                session.conversation.record_turn_result(
-                    user_text="",  # greeting has no user text
-                    generated=reply,
-                    heard=heard,
-                )
-
             # Only cache greetings that played fully through AND match the
             # expected duration (so a truncated stream isn't cached as canon).
             if played_full and collected_audio and heard:
@@ -781,9 +807,20 @@ class TwilioSarvamAgent(BaseVoiceAgent):
                     self.config.agent_name,
                     heard,
                 )
+        except asyncio.CancelledError:
+            # Mid-stream cancel — capture the prefix actually shipped so it
+            # makes it into the transcript.
+            heard = self._estimate_heard_text(reply, sent)
+            raise
         finally:
             if session.conversation.speak_session_id == local_id:
                 session.conversation.is_agent_speaking = False
+            if heard:
+                session.conversation.record_turn_result(
+                    user_text="",  # greeting has no user text
+                    generated=reply,
+                    heard=heard,
+                )
 
     # Twilio plays mulaw at 8000 bytes/sec; natural speech is ~2.5 words/sec.
     _TWILIO_BYTES_PER_SEC = 8000
@@ -854,6 +891,9 @@ class TwilioSarvamAgent(BaseVoiceAgent):
         send_failed = False
         t_first_audio: Optional[float] = None
         t_speak_start = time.monotonic()
+        # Reset the running partial-heard before this utterance starts so a
+        # cancelled turn doesn't pick up a prior turn's prefix.
+        session.last_speak_partial = ""
 
         async for audio_chunk in session.tts.synthesize(text):
             # Barge-in check via session id (race-free). Falls back to
@@ -881,6 +921,11 @@ class TwilioSarvamAgent(BaseVoiceAgent):
             if t_first_audio is None:
                 t_first_audio = time.monotonic()
             sent += len(audio_chunk)
+            # Publish running partial-heard so `_run_turn`'s finally can
+            # still record the agent line if this task is cancelled before
+            # we return cleanly. Word-aligned to keep the stored transcript
+            # grammatical.
+            session.last_speak_partial = self._estimate_heard_text(text, sent)
             # Pace at real-time (8000 mulaw bytes/sec). Without this we blast
             # the whole utterance into Twilio's buffer in milliseconds; barge-in
             # then has nothing to clear because Twilio already started playback,
