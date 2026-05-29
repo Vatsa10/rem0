@@ -6,71 +6,74 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
-# Sarvam bulbul:v3 WebSocket TTS voices (verified from API, April 2026).
-# Docs: https://docs.sarvam.ai/api-reference-docs/text-to-speech/stream
-# Model is activated via ?model=bulbul:v3 query param on the WS URL.
+# Provider codes for the low-latency WS stack:
+#   STT = Deepgram Nova    (stt_lang — Deepgram language code)
+#   TTS = Cartesia Sonic   (tts_lang — Cartesia language code)
 #
-# Female: priya, neha, pooja, ritu, simran, kavya, ishita, shreya, roopa,
-#         tanya, shruti, suhani, kavitha, rupali, niharika
-# Male:   rohan, aditya, rahul, amit, dev, varun, manan, sumit, kabir, aayan,
-#         shubh, ashutosh, advait, anand, tarun, sunny, mani, gokul, vijay,
-#         mohit, rehan, soham
+# Voice: Cartesia voices are MULTILINGUAL — one voice id speaks every Cartesia
+# language via the `language` param — so the voice id comes from a single env
+# var (CARTESIA_VOICE_ID), not per-language here.
 #
-# NOT in v3 (v2-only): anushka, abhilash, manisha, vidya, arya, karun, hitesh
+# IMPORTANT coverage note: Cartesia Sonic supports only en + hi among Indian
+# languages (full list: en, fr, de, es, pt, zh, ja, hi, it, ko, nl, pl, ru,
+# sv, tr). Languages without native Cartesia support fall back to tts_lang
+# "hi" so the call doesn't crash — the audio won't be correct for those. If
+# you need Tamil/Telugu/etc TTS, a different provider (Azure/ElevenLabs) is
+# required. Deepgram STT uses "multi" for Indian code-switching (Hinglish).
 LANGUAGE_CONFIGS = {
     "hi-IN": {
-        "stt_code": "hi-IN",
-        "tts_voice": "priya",
+        "stt_lang": "hi",
+        "tts_lang": "hi",
         "llm_hint": "Respond in Hindi (Devanagari script). Keep responses conversational and natural.",
     },
     "gu-IN": {
-        "stt_code": "gu-IN",
-        "tts_voice": "priya",
+        "stt_lang": "multi",
+        "tts_lang": "hi",  # Cartesia: no Gujarati — falls back to Hindi
         "llm_hint": "Respond in Gujarati (Gujarati script). Keep responses conversational and natural.",
     },
     "en-IN": {
-        "stt_code": "en-IN",
-        "tts_voice": "rohan",
+        "stt_lang": "en-IN",
+        "tts_lang": "en",
         "llm_hint": "Respond in English with an Indian conversational style.",
     },
     "ta-IN": {
-        "stt_code": "ta-IN",
-        "tts_voice": "priya",
+        "stt_lang": "ta",
+        "tts_lang": "hi",  # Cartesia: no Tamil — falls back to Hindi
         "llm_hint": "Respond in Tamil (Tamil script). Keep responses conversational and natural.",
     },
     "te-IN": {
-        "stt_code": "te-IN",
-        "tts_voice": "priya",
+        "stt_lang": "te",
+        "tts_lang": "hi",  # Cartesia: no Telugu — falls back to Hindi
         "llm_hint": "Respond in Telugu (Telugu script). Keep responses conversational and natural.",
     },
     "bn-IN": {
-        "stt_code": "bn-IN",
-        "tts_voice": "priya",
+        "stt_lang": "multi",
+        "tts_lang": "hi",  # Cartesia: no Bengali — falls back to Hindi
         "llm_hint": "Respond in Bengali (Bengali script). Keep responses conversational and natural.",
     },
     "mr-IN": {
-        "stt_code": "mr-IN",
-        "tts_voice": "priya",
+        "stt_lang": "multi",
+        "tts_lang": "hi",  # Cartesia: no Marathi — falls back to Hindi
         "llm_hint": "Respond in Marathi (Devanagari script). Keep responses conversational and natural.",
     },
     "kn-IN": {
-        "stt_code": "kn-IN",
-        "tts_voice": "priya",
+        "stt_lang": "multi",
+        "tts_lang": "hi",  # Cartesia: no Kannada — falls back to Hindi
         "llm_hint": "Respond in Kannada (Kannada script). Keep responses conversational and natural.",
     },
     "ml-IN": {
-        "stt_code": "ml-IN",
-        "tts_voice": "priya",
+        "stt_lang": "multi",
+        "tts_lang": "hi",  # Cartesia: no Malayalam — falls back to Hindi
         "llm_hint": "Respond in Malayalam (Malayalam script). Keep responses conversational and natural.",
     },
     "pa-IN": {
-        "stt_code": "pa-IN",
-        "tts_voice": "priya",
+        "stt_lang": "multi",
+        "tts_lang": "hi",  # Cartesia: no Punjabi — falls back to Hindi
         "llm_hint": "Respond in Punjabi (Gurmukhi script). Keep responses conversational and natural.",
     },
     "od-IN": {
-        "stt_code": "od-IN",
-        "tts_voice": "priya",
+        "stt_lang": "multi",
+        "tts_lang": "hi",  # Cartesia: no Odia — falls back to Hindi
         "llm_hint": "Respond in Odia (Odia script). Keep responses conversational and natural.",
     },
 }
@@ -78,7 +81,12 @@ LANGUAGE_CONFIGS = {
 
 class CallConfig(BaseModel):
     language: str = "hi-IN"
-    sarvam_api_key: str
+    # STT = Deepgram, TTS = Cartesia (low-latency WS stack). sarvam_api_key
+    # kept optional for backward compat / cached-greeting reuse only.
+    sarvam_api_key: str = ""
+    deepgram_api_key: str = ""
+    cartesia_api_key: str = ""
+    cartesia_voice_id: str = ""
     twilio_account_sid: str
     twilio_auth_token: str
     twilio_from_number: str
@@ -95,6 +103,9 @@ class CallConfig(BaseModel):
         return cls(
             language=language,
             sarvam_api_key=os.getenv("SARVAM_API_KEY", ""),
+            deepgram_api_key=os.getenv("DEEPGRAM_API_KEY", ""),
+            cartesia_api_key=os.getenv("CARTESIA_API_KEY", ""),
+            cartesia_voice_id=os.getenv("CARTESIA_VOICE_ID", ""),
             twilio_account_sid=os.getenv("TWILIO_ACCOUNT_SID", ""),
             twilio_auth_token=os.getenv("TWILIO_AUTH_TOKEN", ""),
             twilio_from_number=os.getenv("TWILIO_FROM_NUMBER", ""),
@@ -117,6 +128,9 @@ class CallConfig(BaseModel):
             company_name=settings.company_name if settings else "Your Company",
             agent_name=settings.agent_name if settings else "Subscription Specialist",
             sarvam_api_key=os.getenv("SARVAM_API_KEY", ""),
+            deepgram_api_key=os.getenv("DEEPGRAM_API_KEY", ""),
+            cartesia_api_key=os.getenv("CARTESIA_API_KEY", ""),
+            cartesia_voice_id=os.getenv("CARTESIA_VOICE_ID", ""),
             twilio_account_sid=os.getenv("TWILIO_ACCOUNT_SID", ""),
             twilio_auth_token=os.getenv("TWILIO_AUTH_TOKEN", ""),
             twilio_from_number=os.getenv("TWILIO_FROM_NUMBER", ""),

@@ -71,7 +71,11 @@ class SarvamSTTClient:
         # size threshold triggering a flush (user paused mid-sentence), push
         # it to Sarvam so VAD can still fire speech_end.
         self._last_flush_time = 0.0
-        self._flush_timeout_sec = 0.3
+        # 200ms pause-flush: pushes held audio to Sarvam fast so VAD can fire
+        # END_SPEECH sooner → final transcript sooner → lower turn latency.
+        # Lower than this starts splitting single utterances into multiple
+        # finals (STT cascade), so 200ms is the floor.
+        self._flush_timeout_sec = 0.2
         self._receive_loop_task: Optional[asyncio.Task] = None
 
     @property

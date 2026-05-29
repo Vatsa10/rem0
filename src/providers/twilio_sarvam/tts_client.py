@@ -327,6 +327,129 @@ class SarvamTTSClient:
             f"wall_sec={wall_sec:.2f}, end_reason={end_reason}"
         )
 
+    async def synthesize_stream(
+        self, text_iter: "AsyncGenerator[str, None]"
+    ) -> AsyncGenerator[bytes, None]:
+        """
+        Pipelined TTS: send text pieces to Sarvam AS they arrive (e.g. phrase
+        chunks from a streaming LLM), reading audio back concurrently. First
+        audio starts after the FIRST phrase instead of the whole reply — this
+        is the big latency win over synthesize() (which needs the full text
+        up front).
+
+        All pieces share one synthesis context (no flush between them), so
+        prosody stays continuous. A single `flush` is sent after the feeder
+        drains. Same drain/cancel semantics as synthesize().
+        """
+        if not self.is_open:
+            logger.warning("TTS synthesize_stream: not open, skipping")
+            return
+
+        # Same cancel-drain reset as synthesize() so stale audio from a
+        # previous (cancelled) utterance can't leak into this one.
+        if self._cancelled:
+            await asyncio.sleep(0.10)
+        try:
+            while True:
+                self._audio_queue.get_nowait()
+        except asyncio.QueueEmpty:
+            pass
+        self._cancelled = False
+        self._accepting_audio = True
+
+        sent_any_text = False
+
+        async def feeder() -> None:
+            nonlocal sent_any_text
+            try:
+                async for piece in text_iter:
+                    clean = (piece or "").strip()
+                    if not clean or not any(c.isalnum() for c in clean):
+                        continue
+                    if self._cancelled or not self.is_open:
+                        return
+                    sent_any_text = True
+                    # Trailing space — pieces are stripped phrases; without it
+                    # Sarvam concatenates "Tuesday." + "would" → "Tuesday.would".
+                    await self.ws.send(
+                        json.dumps({"type": "text", "data": {"text": clean + " "}})
+                    )
+                if sent_any_text and self.is_open:
+                    await self.ws.send(json.dumps({"type": "flush"}))
+            except websockets.ConnectionClosed:
+                self._is_open = False
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error(f"TTS stream feeder error: {e}")
+
+        feed_task = asyncio.create_task(feeder())
+
+        FIRST_CHUNK_TIMEOUT = 5.0
+        INACTIVITY_TIMEOUT = 8.0
+        POST_FINAL_DRAIN_SEC = 0.25
+        chunks_yielded = 0
+        bytes_yielded = 0
+        timeout = FIRST_CHUNK_TIMEOUT
+        end_reason = "unknown"
+        t_start = time.monotonic()
+
+        try:
+            while True:
+                try:
+                    chunk = await asyncio.wait_for(
+                        self._audio_queue.get(), timeout=timeout
+                    )
+                    if chunk is None:
+                        end_reason = "final_event"
+                        drain_until = time.monotonic() + POST_FINAL_DRAIN_SEC
+                        while time.monotonic() < drain_until:
+                            try:
+                                extra = await asyncio.wait_for(
+                                    self._audio_queue.get(),
+                                    timeout=max(0.02, drain_until - time.monotonic()),
+                                )
+                            except asyncio.TimeoutError:
+                                break
+                            if extra is None:
+                                continue
+                            if self._cancelled:
+                                break
+                            chunks_yielded += 1
+                            bytes_yielded += len(extra)
+                            yield extra
+                        break
+                    if self._cancelled:
+                        end_reason = "cancelled"
+                        break
+                    chunks_yielded += 1
+                    bytes_yielded += len(chunk)
+                    yield chunk
+                    timeout = INACTIVITY_TIMEOUT
+                except asyncio.TimeoutError:
+                    if chunks_yielded == 0:
+                        end_reason = "no_first_chunk"
+                        logger.warning(
+                            f"TTS stream: no audio in {timeout}s (feeder "
+                            f"sent_text={sent_any_text})"
+                        )
+                    else:
+                        end_reason = "inactivity_timeout"
+                        logger.warning(
+                            f"TTS stream: inactivity_timeout after {chunks_yielded} "
+                            f"chunks ({bytes_yielded}B)"
+                        )
+                    break
+        finally:
+            if not feed_task.done():
+                feed_task.cancel()
+            wall_sec = time.monotonic() - t_start
+            logger.info(
+                f"TTS stream complete: chunks={chunks_yielded}, "
+                f"bytes={bytes_yielded}, audio_sec={bytes_yielded / 8000.0:.2f}, "
+                f"wall_sec={wall_sec:.2f}, end_reason={end_reason}"
+            )
+
     def cancel(self) -> None:
         """
         Cancel current TTS generation (for barge-in).
